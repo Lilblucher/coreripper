@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["backend/run_local.sh"],
+      "port": 8000
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["_nocache_server.py", "5501"],
+      "port": 5501
+    }
+  ]
+}

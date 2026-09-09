@@ -1,0 +1,7 @@
+# Terminal tab 1
+cd backend
+/home/clive/anaconda3/bin/python -m celery -A core_backend worker -l info --concurrency=2
+
+# Terminal tab 2
+cd backend
+/home/clive/anaconda3/bin/python -m celery -A core_backend beat -l info

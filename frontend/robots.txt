@@ -1,0 +1,27 @@
+User-agent: Google-Extended
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: GPTBot
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+
+
+
+User-agent: *
+Allow: /
+Disallow: /dashboard.html
+Disallow: /settings.html
+Disallow: /billing.html
+Disallow: /admin.html
+Disallow: /forgot-password.html
+Disallow: /reset-password.html
+
+Sitemap: https://coreripper.site/sitemap.xml
+Sitemap: https://coreripper.site/blog/sitemap.xml
+Sitemap: https://coreripper.site/news/sitemap.xml
+Sitemap: https://coreripper.site/hardware/sitemap.xml

@@ -1,0 +1,25 @@
+<svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="coreGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2597E8"></stop>
+      <stop offset="100%" stop-color="#2597E8"></stop>
+    </linearGradient>
+    <linearGradient id="pulseGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#15A6DE"></stop>
+      <stop offset="100%" stop-color="#2597E8"></stop>
+    </linearGradient>
+    <linearGradient id="borderGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2597E8"></stop>
+      <stop offset="100%" stop-color="#15A6DE"></stop>
+    </linearGradient>
+  </defs>
+
+  <rect x="1" y="1" width="38" height="38" rx="12" fill="#0f0f13"></rect>
+  <rect x="1" y="1" width="38" height="38" rx="12" fill="none" stroke="url(#borderGradient)" stroke-width="1.5"></rect>
+
+  <g transform="translate(6.5,6)">
+    <path d="M 16.5 3.4 L 6.1 9.6 L 6.1 24.5 L 12.5 28.2" stroke="url(#coreGradient)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"></path>
+    <path d="M 16.5 30.8 L 27 24.5 L 27 9.6 L 21 5.8" stroke="url(#coreGradient)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"></path>
+    <path d="M 2 19 L 12.5 10.6 L 18 24.5 L 31.5 9.6" stroke="url(#pulseGradient)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"></path>
+  </g>
+</svg>

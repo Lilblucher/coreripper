@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reverse IP Lookup - CoreLom | Network Tools</title>
+    <link rel="icon" href="../assets/logo/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="../assets/logo/favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="../assets/logo/favicon-16.png" sizes="16x16" type="image/png">
+    <link rel="apple-touch-icon" href="../assets/logo/apple-touch-icon-180.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * {
+            font-family: 'Inter', sans-serif;
+            scroll-behavior: smooth;
+        }
+        body {
+            background-color: #0a0a0a;
+            color: #e5e7eb;
+        }
+        .gradient-text {
+            background: #2597e8;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .nav-link { color: #d1d5db; transition: color 0.3s ease; }
+        .nav-link:hover, .nav-link.active { color: #2597E8; }
+        .cta-btn {
+            background: #2597e8;
+            transition: all 0.3s ease;
+        }
+        .cta-btn:hover {
+            box-shadow: 0 4px 0 rgba(0,0,0,0.45);
+            transform: translateY(-2px);
+        }
+        .cta-btn:disabled { cursor: not-allowed; }
+        .icon-box {
+            width: 48px;
+            height: 48px;
+            border-radius: 12px;
+            background: #141414;
+            border: 1.5px solid #2597E855;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #2597E8;
+        }
+        .icon-box.lg { width: 64px; height: 64px; }
+
+        .field-input {
+            width: 100%;
+            background: #0d0d0d;
+            border: 1px solid #374151;
+            border-radius: 0.5rem;
+            padding: 0.75rem 1rem;
+            color: #e5e7eb;
+            font-family: 'Courier New', monospace;
+        }
+        .field-input:focus { outline: none; border-color: #2597E8; box-shadow: 0 0 0 3px rgba(37,151,232,0.15); }
+
+        .data-table { width: 100%; border-collapse: collapse; }
+        .data-table thead th {
+            text-align: left;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            color: #6b7280;
+            padding: 0.9rem 1.5rem;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }
+        .data-table tbody td {
+            padding: 0.9rem 1.5rem;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            font-size: 0.9rem;
+            color: #e5e7eb;
+            vertical-align: middle;
+        }
+        .data-table tbody tr:last-child td { border-bottom: none; }
+        .data-table tbody tr:hover { background: rgba(255,255,255,0.02); }
+        .mono-cell { font-family: 'Courier New', monospace; word-break: break-all; }
+        .row-index { color: #6b7280; font-family: 'Courier New', monospace; width: 3rem; }
+
+        .error-banner {
+            border: 1px solid rgba(248, 113, 113, 0.4);
+            background: rgba(248, 113, 113, 0.08);
+            color: #f87171;
+            border-radius: 0.75rem;
+            padding: 1rem 1.25rem;
+            font-size: 0.9rem;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 4rem 2rem;
+            color: #6b7280;
+        }
+
+        .spinner {
+            border: 4px solid rgba(37,151,232, 0.2);
+            border-top-color: #ffffff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .tool-nav-link {
+            color: #2597E8;
+            font-weight: 600;
+            font-size: 0.9rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            transition: opacity 0.2s ease;
+        }
+        .tool-nav-link:hover { opacity: 0.8; }
+
+        /* Light Mode Overrides */
+        body.light-mode { background-color: #f3f4f6; color: #1f2937; }
+        body.light-mode nav { background-color: rgba(255, 255, 255, 0.8); border-color: #e5e7eb; }
+        body.light-mode .nav-link { color: #4b5563; }
+        body.light-mode .nav-link:hover, body.light-mode .nav-link.active { color: #2597E8; }
+        body.light-mode .border-gray-800 { border-color: #e5e7eb; }
+        body.light-mode .text-gray-400 { color: #4b5563; }
+        body.light-mode .text-gray-500 { color: #6b7280; }
+        body.light-mode h1, body.light-mode h2, body.light-mode h3 { color: #111827; }
+        body.light-mode .bg-black\/40 { background-color: #f9fafb; }
+        body.light-mode .field-input { background: #ffffff; border-color: #d1d5db; color: #111827; }
+        body.light-mode .data-table tbody td, body.light-mode .data-table thead th { border-color: #e5e7eb; }
+        body.light-mode .data-table tbody td { color: #111827; }
+
+        /* ============ Micro-interactions ============ */
+
+        /* 1. Search bar: glow + scale on focus, icon slide */
+        .field-input { transition: border-color 200ms ease-out, box-shadow 200ms ease-out, transform 200ms ease-out; }
+        .field-input:focus { transform: scale(1.01); box-shadow: 0 0 0 3px rgba(37,151,232,0.15), 0 4px 24px rgba(37,151,232,0.18); }
+        .flex-1.relative svg { transition: transform 200ms ease-out; }
+        .flex-1.relative:focus-within svg { transform: translateX(3px); }
+
+        /* 3. Lookup button hover/click */
+        .cta-btn:hover:not(:disabled) { transform: translateY(-2px) scale(1.03); }
+        .cta-btn:active:not(:disabled) { transform: scale(0.98); }
+
+        /* 4. Loading message pulse */
+        @keyframes pulseText { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+        .loading-message { animation: pulseText 1.4s ease-in-out infinite; }
+
+        /* 5 & 6. Results / table row stagger reveal (auto-triggers on mount) */
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .kv-row, .data-table tbody tr { animation: fadeInUp 320ms ease-out both; }
+        .kv-row:nth-child(1), .data-table tbody tr:nth-child(1) { animation-delay: 0ms; }
+        .kv-row:nth-child(2), .data-table tbody tr:nth-child(2) { animation-delay: 40ms; }
+        .kv-row:nth-child(3), .data-table tbody tr:nth-child(3) { animation-delay: 80ms; }
+        .kv-row:nth-child(4), .data-table tbody tr:nth-child(4) { animation-delay: 120ms; }
+        .kv-row:nth-child(5), .data-table tbody tr:nth-child(5) { animation-delay: 160ms; }
+        .kv-row:nth-child(6), .data-table tbody tr:nth-child(6) { animation-delay: 200ms; }
+        .kv-row:nth-child(7), .data-table tbody tr:nth-child(7) { animation-delay: 240ms; }
+        .kv-row:nth-child(8), .data-table tbody tr:nth-child(8) { animation-delay: 280ms; }
+        .kv-row:nth-child(n+9), .data-table tbody tr:nth-child(n+9) { animation-delay: 320ms; }
+        #resultsContent, #resultsWrap { animation: fadeInUp 280ms ease-out both; }
+
+        /* 8. Empty state float */
+        @keyframes floatY { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+        #emptyState svg { animation: floatY 3s ease-in-out infinite; }
+        #emptyState p { animation: pulseText 2.6s ease-in-out infinite; }
+
+        /* 9. Success toast (shared component) */
+        .success-toast {
+            position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(12px);
+            display: inline-flex; align-items: center; gap: 0.5rem;
+            background: #16a34a; color: #fff; padding: 0.6rem 1.1rem; border-radius: 999px;
+            font-size: 0.85rem; font-weight: 600; box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+            opacity: 0; transition: opacity 220ms ease-out, transform 220ms ease-out;
+            z-index: 100; pointer-events: none;
+        }
+        .success-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+        /* 10. Nav underline */
+        .nav-link { position: relative; }
+        .nav-link::after {
+            content: ''; position: absolute; left: 0; right: 100%; bottom: -6px; height: 2px;
+            background: currentColor; transition: right 220ms ease-out;
+        }
+        .nav-link:hover::after, .nav-link.active::after { right: 0; }
+        .tool-nav-link { position: relative; }
+        .tool-nav-link::after {
+            content: ''; position: absolute; left: 0; right: 100%; bottom: -3px; height: 2px;
+            background: currentColor; transition: right 220ms ease-out;
+        }
+        .tool-nav-link:hover::after { right: 0; }
+
+        /* 12. Accessibility: visible focus */
+        a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible {
+            outline: 2px solid #2597E8; outline-offset: 2px; border-radius: 4px;
+        }
+
+        /* 12. Reduced motion */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-delay: 0ms !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
+    
+        /* === CoreRipper Logo Animation (shared) === */
+        .cr-logo { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; }
+        .cr-logo-tile {
+            width: 40px; height: 40px; border-radius: 12px;
+            background: linear-gradient(180deg, #17171c 0%, #0f0f13 100%) padding-box,
+                        linear-gradient(135deg, #2597E8 0%, #15A6DE 100%) border-box;
+            border: 1.5px solid transparent;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .cr-icon-wrap { display: flex; align-items: center; justify-content: center; animation: cr-breathe 2.6s ease-in-out 1.6s infinite; }
+        .cr-wordmark { display: inline-flex; align-items: baseline; font-size: 22px; font-weight: 800; letter-spacing: -0.02em; color: #e5e7eb; }
+        .cr-word-core { display: inline-block; color: #e5e7eb; animation: cr-core-in .45s ease-out .08s both; }
+        .cr-word-ripper-wrap { position: relative; display: inline-block; }
+        .cr-word-ripper-wrap .cr-half { display: inline-block; background: #2597e8; -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .cr-word-ripper-wrap .cr-half.top { clip-path: polygon(0% 0%, 100% 0%, 100% 34%, 62% 46%, 30% 54%, 0% 64%); animation: cr-rip-top .5s cubic-bezier(.2,.9,.3,1) .84s both; }
+        .cr-word-ripper-wrap .cr-half.bottom { position: absolute; left: 0; top: 0; clip-path: polygon(0% 64%, 30% 54%, 62% 46%, 100% 34%, 100% 100%, 0% 100%); animation: cr-rip-bottom .5s cubic-bezier(.2,.9,.3,1) .84s both; }
+        .cr-rip-streak { position: absolute; left: -6%; top: 47%; width: 0; height: 3px; border-radius: 2px; background: #15a6de; box-shadow: 0 4px 0 rgba(0,0,0,0.45); transform: rotate(-6deg); transform-origin: left center; animation: cr-rip-streak .45s ease-out .76s both; }
+
+        .cr-hex { stroke-dasharray: 1; stroke-dashoffset: 1; opacity: .5; animation: cr-draw-hex .55s cubic-bezier(.4,0,.2,1) 0s both, cr-hex-out .18s .68s forwards; }
+        .cr-frame { opacity: 0; animation: cr-frame-in .25s .68s both; }
+        .cr-frame.b { animation-delay: .74s; }
+        .cr-shard-a { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cr-shard-a .5s .68s both; }
+        .cr-shard-b { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cr-shard-b .5s .68s both; }
+        .cr-pulse { stroke-dasharray: 1; stroke-dashoffset: 1; animation: cr-draw-pulse .7s cubic-bezier(.16,1,.3,1) .72s both; }
+
+        @keyframes cr-draw-hex { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+        @keyframes cr-hex-out { to { opacity: 0; } }
+        @keyframes cr-frame-in { from { opacity: 0; } to { opacity: .45; } }
+        @keyframes cr-shard-a { 0% { opacity: 0; transform: none; } 20% { opacity: .55; } 100% { opacity: 0; transform: translate(4px, -5px) rotate(10deg); } }
+        @keyframes cr-shard-b { 0% { opacity: 0; transform: none; } 20% { opacity: .55; } 100% { opacity: 0; transform: translate(-4px, 5px) rotate(10deg); } }
+        @keyframes cr-draw-pulse { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+        @keyframes cr-core-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+        @keyframes cr-rip-top { 0% { opacity: 0; transform: translate(10px, -9px) rotate(2deg); } 60% { opacity: 1; transform: translate(-1px, 1px) rotate(-0.5deg); } 100% { opacity: 1; transform: none; } }
+        @keyframes cr-rip-bottom { 0% { opacity: 0; transform: translate(-10px, 9px) rotate(-2deg); } 60% { opacity: 1; transform: translate(1px, -1px) rotate(0.5deg); } 100% { opacity: 1; transform: none; } }
+        @keyframes cr-rip-streak { 0% { width: 0%; opacity: 0; } 15% { opacity: 1; } 80% { opacity: 1; } 100% { width: 116%; opacity: 0; } }
+        @keyframes cr-breathe {
+            0%, 100% { filter: drop-shadow(0 0 5px rgba(21,166,222,.45)) drop-shadow(0 0 2px rgba(37,151,232,.3)); }
+            50% { filter: drop-shadow(0 0 15px rgba(37,151,232,.85)) drop-shadow(0 0 5px rgba(21,166,222,.55)); }
+        }
+
+        .cr-splash {
+            position: fixed; inset: 0; z-index: 9999; background: #0a0a0a;
+            display: flex; align-items: center; justify-content: center; overflow: hidden;
+            opacity: 1; transition: opacity 0.4s ease-out;
+        }
+        .cr-splash.cr-splash-hide { opacity: 0; pointer-events: none; }
+        .cr-splash-glow {
+            position: absolute; inset: 0; pointer-events: none; opacity: 0;
+            background: none;
+            animation: cr-bg-glow-in 1s ease-out 2.1s forwards, cr-bg-glow-breathe 4s ease-in-out 3.1s infinite;
+        }
+        .cr-splash .cr-lockup { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+        .cr-splash .cr-icon-wrap {
+            position: relative;
+            animation: cr-load-glow 1.6s ease-in-out 1.42s forwards, cr-dim-idle 4s ease-in-out 3.02s infinite;
+        }
+        .cr-splash .cr-wordmark { font-size: 28px; }
+        @keyframes cr-load-glow {
+            0%   { filter: drop-shadow(0 0 6px rgba(21,166,222,.5)) drop-shadow(0 0 2px rgba(37,151,232,.3)); }
+            35%  { filter: drop-shadow(0 0 26px rgba(37,151,232,1)) drop-shadow(0 0 10px rgba(21,166,222,.9)); }
+            55%  { filter: drop-shadow(0 0 26px rgba(37,151,232,1)) drop-shadow(0 0 10px rgba(21,166,222,.9)); }
+            100% { filter: drop-shadow(0 0 3px rgba(21,166,222,.2)) drop-shadow(0 0 0px rgba(37,151,232,0)); }
+        }
+        @keyframes cr-dim-idle {
+            0%, 100% { filter: drop-shadow(0 0 3px rgba(21,166,222,.2)) drop-shadow(0 0 0px rgba(37,151,232,0)); }
+            50% { filter: drop-shadow(0 0 8px rgba(37,151,232,.45)) drop-shadow(0 0 2px rgba(21,166,222,.25)); }
+        }
+        @keyframes cr-bg-glow-in { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes cr-bg-glow-breathe {
+            0%, 100% { opacity: .7; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.06); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .cr-icon-wrap, .cr-hex, .cr-frame, .cr-shard-a, .cr-shard-b, .cr-pulse,
+            .cr-word-core, .cr-half.top, .cr-half.bottom, .cr-rip-streak {
+                animation: none !important;
+                opacity: 1 !important;
+            }
+            .cr-hex { display: none; }
+            .cr-frame { opacity: .45 !important; }
+            .cr-shard-a, .cr-shard-b { display: none; }
+            .cr-half.top, .cr-half.bottom { clip-path: none !important; }
+            .cr-rip-streak { display: none; }
+        }
+
+        body.light-mode .cr-word-core, body.light-mode .cr-wordmark { color: #0a0a0a; }
+    </style>
+<style>/* nav breakpoint raised to 1040px so links never cram */
+.cr-nav-links{display:none}
+.cr-menu-btn{display:none}
+@media (max-width:1039.98px){.cr-menu-btn{display:inline-flex !important}}
+@media (min-width:1040px){.cr-nav-links{display:flex}#crMobileMenu{display:none !important}}
+.cr-menu-btn{flex-direction:column;align-items:flex-start;justify-content:center;gap:4px;padding:8px}
+.cr-bar{display:block;width:20px;height:2px;background:currentColor;border-radius:2px;transform-origin:left center;transition:transform .35s cubic-bezier(.4,0,.2,1),width .35s cubic-bezier(.4,0,.2,1),opacity .25s ease}
+.cr-menu-btn.open .cr-bar1{transform:translate(2px,3px) rotate(45deg);width:12px}
+.cr-menu-btn.open .cr-bar2{opacity:0;transform:scaleX(0)}
+.cr-menu-btn.open .cr-bar3{transform:translate(10.5px,-0.5px) rotate(-45deg);width:12px}
+#crMobileMenu{display:flex;flex-direction:column;gap:4px;padding:0 24px;max-height:0;overflow:hidden;opacity:0;border-top:1px solid transparent;transition:max-height .4s cubic-bezier(.4,0,.2,1),opacity .35s ease,padding .4s cubic-bezier(.4,0,.2,1)}
+#crMobileMenu.open{max-height:420px;opacity:1;padding:12px 24px 16px;border-top-color:#1f2937}
+</style>
+</head>
+<body>
+    <div class="cr-splash" id="crSplash">
+      <div class="cr-splash-glow"></div>
+      <div class="cr-lockup" id="crSplashLockup">
+        <div class="cr-icon-wrap">
+          <svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="coreGradient-splash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+              <linearGradient id="pulseGradient-splash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+              <filter id="neonGlow-splash" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+            </defs>
+            <path class="cr-hex" d="M 32 6 L 52 18 L 52 46 L 32 58 L 12 46 L 12 18 Z" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" />
+            <path class="cr-frame" d="M 32 6 L 12 18 L 12 46 L 24 53" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+            <path class="cr-frame b" d="M 32 58 L 52 46 L 52 18 L 40 11" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+            <path class="cr-shard-a" d="M 32 6 L 40 11" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" />
+            <path class="cr-shard-b" d="M 32 58 L 24 53" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" />
+            <path class="cr-pulse" d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-splash)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-splash)" pathLength="1" />
+          </svg>
+        </div>
+        <div class="cr-wordmark">
+          <span class="cr-word-core">Core</span>
+          <span class="cr-word-ripper-wrap">
+            <span class="cr-half top">Ripper</span>
+            <span class="cr-half bottom">Ripper</span>
+            <span class="cr-rip-streak"></span>
+          </span>
+        </div>
+      </div>
+    </div>
+    <script src="../assets/logo/animated-favicon.js"></script>
+    <script>
+    (function () {
+      var splash = document.getElementById('crSplash');
+      if (!splash) return;
+      if (sessionStorage.getItem('crSplashPlayed')) { splash.remove(); return; }
+      sessionStorage.setItem('crSplashPlayed', '1');
+      var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (window.CoreRipperFavicon) { window.CoreRipperFavicon.init(); }
+      // Hold the splash for the full entrance+glow+dim sequence (~3.2s) even
+      // if the page itself loads faster, so the animation isn't cut short 
+      // but never hold *less* than actual load time if the page is slower.
+      var MIN_DISPLAY_MS = reduced ? 200 : 3200;
+      var mountedAt = performance.now();
+      var loaded = false;
+      function removeSplash() {
+        var elapsed = performance.now() - mountedAt;
+        var wait = Math.max(0, MIN_DISPLAY_MS - elapsed);
+        setTimeout(function () {
+          splash.classList.add('cr-splash-hide');
+          setTimeout(function () { splash.remove(); }, 450);
+        }, wait);
+      }
+      if (document.readyState === 'complete') {
+        removeSplash();
+      } else {
+        window.addEventListener('load', removeSplash);
+      }
+    })();
+    </script>
+    <!-- Navigation -->
+    <nav class="border-b border-gray-800 sticky top-0 z-50 backdrop-blur-md bg-black/80">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex items-center gap-3">
+                    <a href="../index.html" class="cr-logo">
+                    <div class="cr-logo-tile">
+                      <div class="cr-icon-wrap">
+                        <svg width="26" height="26" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <defs>
+                            <linearGradient id="coreGradient-nav" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                            <linearGradient id="pulseGradient-nav" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                            <filter id="neonGlow-nav" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+                          </defs>
+                          <path class="cr-hex" d="M 32 6 L 52 18 L 52 46 L 32 58 L 12 46 L 12 18 Z" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" />
+                          <path class="cr-frame" d="M 32 6 L 12 18 L 12 46 L 24 53" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+                          <path class="cr-frame b" d="M 32 58 L 52 46 L 52 18 L 40 11" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+                          <path class="cr-shard-a" d="M 32 6 L 40 11" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" />
+                          <path class="cr-shard-b" d="M 32 58 L 24 53" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" />
+                          <path class="cr-pulse" d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-nav)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-nav)" pathLength="1" />
+                        </svg>
+                      </div>
+                    </div>
+                    <div class="cr-wordmark">
+                      <span class="cr-word-core">Core</span>
+                      <span class="cr-word-ripper-wrap">
+                        <span class="cr-half top">Ripper</span>
+                        <span class="cr-half bottom">Ripper</span>
+                        <span class="cr-rip-streak"></span>
+                      </span>
+                    </div>
+                </a>
+                </div>
+                <div class="cr-nav-links gap-8">
+                    <a href="../dev_tools.html" class="nav-link font-medium">Developer Tools</a>
+                    <a href="../ai_tools.html" class="nav-link font-medium">AI Tools</a>
+                    <a href="../net_tools.html" class="nav-link active font-medium">Network Tools</a>
+                    <a href="../blog.html" class="nav-link font-medium">Blog</a>
+                    <a href="#pricing" class="nav-link font-medium">Pricing</a>
+                </div>
+                <div class="flex items-center gap-4">
+                    <a href="../login.html" class="text-gray-400 hover:text-[#15A6DE] transition font-medium" id="navLogin">Login</a>
+                    <button class="cta-btn px-6 py-2 rounded-lg font-semibold text-white" id="navCta" onclick="window.location.href='../signup.html'">Get Started</button>
+                    <button class="cr-menu-btn" aria-label="Toggle navigation menu" aria-expanded="false" style="background:none;border:none;cursor:pointer;color:#d1d5db;" onclick="var m=document.getElementById('crMobileMenu');var open=m.classList.toggle('open');this.classList.toggle('open',open);this.setAttribute('aria-expanded',open);"><span class="cr-bar cr-bar1"></span><span class="cr-bar cr-bar2"></span><span class="cr-bar cr-bar3"></span></button>
+                </div>
+            </div>
+        </div>
+            <div id="crMobileMenu">
+            <a href="../index.html">Home</a>
+            <a href="../dev_tools.html" class="nav-link font-medium">Developer Tools</a>
+            <a href="../ai_tools.html" class="nav-link font-medium">AI Tools</a>
+            <a href="../net_tools.html" class="nav-link active font-medium">Network Tools</a>
+            <a href="../blog.html" class="nav-link font-medium">Blog</a>
+            <a href="#pricing" class="nav-link font-medium">Pricing</a>
+        </div>
+    </nav>
+
+    <!-- Header -->
+    <section class="py-10 px-4 sm:px-6 lg:px-8 border-b border-gray-800">
+        <div class="max-w-4xl mx-auto">
+            <a href="../net_tools.html" class="text-gray-400 hover:text-[#15A6DE] transition flex items-center gap-2 mb-6 text-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                Back to Network Tools
+            </a>
+            <div class="flex items-center gap-4">
+                <div class="icon-box">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                </div>
+                <div>
+                    <h1 class="text-3xl font-bold">Reverse IP Lookup</h1>
+                    <p class="text-gray-400 mt-1">Find domains hosted on an IP address.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Main Tool -->
+    <section class="py-10 px-4 sm:px-6 lg:px-8">
+        <div class="max-w-4xl mx-auto">
+            <!-- Search Bar -->
+            <div class="flex gap-4 mb-6">
+                <div class="flex-1 relative">
+                    <svg class="absolute left-4 top-3.5 w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    <input
+                        type="text"
+                        id="targetInput"
+                        placeholder="Enter an IP or domain (e.g. 8.8.8.8)..."
+                        class="field-input pl-12"
+                    >
+                </div>
+                <button id="lookupBtn" onclick="performReverseIpLookup()" class="cta-btn px-8 py-3 rounded-lg font-semibold text-white flex items-center gap-2 whitespace-nowrap">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                    </svg>
+                    Lookup
+                </button>
+            </div>
+
+            <!-- Error Banner -->
+            <div id="errorBanner" class="error-banner mb-6 hidden"></div>
+
+            <!-- Results Card -->
+            <div class="border border-gray-800 rounded-2xl bg-black/40 overflow-hidden" id="resultsCard">
+                <!-- Empty state -->
+                <div id="emptyState" class="empty-state">
+                    <svg class="w-16 h-16 text-gray-700 mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                    </svg>
+                    <p class="text-gray-400 text-lg">Enter an IP address above.</p>
+                </div>
+
+                <!-- Results content (hidden until a successful lookup) -->
+                <div id="resultsContent" class="hidden">
+                    <div class="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+                        <div class="flex items-center gap-2">
+                            <svg class="w-4 h-4 text-[#15A6DE]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                            <span class="font-semibold" id="resultsHeader">Domains on</span>
+                        </div>
+                        <button onclick="exportDomains()" class="text-gray-400 hover:text-[#15A6DE] transition text-sm flex items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                            Export
+                        </button>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="data-table">
+                            <thead>
+                                <tr><th class="row-index">#</th><th>Domain</th></tr>
+                            </thead>
+                            <tbody id="resultsBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+
+
+            <!-- Cross-nav -->
+            <div class="flex justify-between items-center mt-10 pt-6 border-t border-gray-800">
+                <a href="asn.htm" class="tool-nav-link">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                    ASN Lookup
+                </a>
+                <a href="ip_blacklist.htm" class="tool-nav-link">
+                    IP Blacklist Checker
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="border-t border-gray-800 py-12 px-4 sm:px-6 lg:px-8">
+        <div class="max-w-7xl mx-auto">
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-8 mb-8">
+                <div class="lg:col-span-2">
+                    <div class="flex items-center gap-2 mb-4">
+                        <div class="cr-logo-tile">
+                          <svg width="26" height="26" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <defs>
+                              <linearGradient id="coreGradient-footer" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                              <linearGradient id="pulseGradient-footer" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                              <filter id="neonGlow-footer" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+                            </defs>
+                            <path d="M 32 6 L 12 18 L 12 46 L 24 53" stroke="url(#coreGradient-footer)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="0.45" />
+                            <path d="M 32 58 L 52 46 L 52 18 L 40 11" stroke="url(#coreGradient-footer)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="0.45" />
+                            <path d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-footer)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-footer)" />
+                          </svg>
+                        </div>
+                        <span class="font-bold text-xl">CoreRipper</span>
+                    </div>
+                    <p class="text-gray-400 text-sm max-w-sm">Everything you need in one powerful toolkit. Developer tools, AI productivity, and network utilities.</p>
+                </div>
+                <div>
+                    <h4 class="font-semibold mb-4">Developer Tools</h4>
+                    <ul class="space-y-2 text-gray-500 text-sm">
+                        <li><a href="../dev_tools.html" class="hover:text-[#2597E8] transition">JSON Formatter</a></li>
+                        <li><a href="../dev_tools.html" class="hover:text-[#2597E8] transition">JWT Decoder</a></li>
+                        <li><a href="../dev_tools.html" class="hover:text-[#2597E8] transition">Password Generator</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4 class="font-semibold mb-4">AI Tools</h4>
+                    <ul class="space-y-2 text-gray-500 text-sm">
+                        <li><a href="../ai_tools.html" class="hover:text-[#2597E8] transition">AI Humanizer</a></li>
+                        <li><a href="../ai_tools.html" class="hover:text-[#2597E8] transition">Grammar Checker</a></li>
+                        <li><a href="../ai_tools.html" class="hover:text-[#2597E8] transition">Code Explainer</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4 class="font-semibold mb-4">Company</h4>
+                    <ul class="space-y-2 text-gray-500 text-sm">
+                        <li><a href="../blog.html" class="hover:text-[#2597E8] transition">Blog</a></li>
+                        <li><a href="#" class="hover:text-[#2597E8] transition">Pricing</a></li>
+                        <li><a href="#" class="hover:text-[#2597E8] transition">About Us</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="border-t border-gray-800 pt-8 flex flex-col md:flex-row justify-between items-center text-sm text-gray-500">
+                <p>© 2026 CoreLom. All rights reserved.</p>
+                <div class="flex items-center gap-6 mt-4 md:mt-0">
+                    <a href="#" class="hover:text-[#2597E8] transition">Privacy</a>
+                    <a href="#" class="hover:text-[#2597E8] transition">Terms</a>
+                    <div class="flex items-center gap-2 pl-4 border-l border-gray-800 ml-2">
+                        <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id="theme-toggle" class="sr-only peer">
+                            <div class="w-10 h-5 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#2597E8]"></div>
+                        </label>
+                        <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // Theme Toggle
+        const themeToggle = document.getElementById('theme-toggle');
+        if (themeToggle) {
+            themeToggle.addEventListener('change', function() {
+                document.body.classList.toggle('light-mode', this.checked);
+            });
+        }
+
+        function esc(val) {
+            if (val === null || val === undefined) return 'N/A';
+            return String(val).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        let lastResult = null; // cached for Export
+
+        async function performReverseIpLookup() {
+            const target = document.getElementById('targetInput').value.trim();
+            const errorBanner = document.getElementById('errorBanner');
+            const emptyState = document.getElementById('emptyState');
+            const resultsContent = document.getElementById('resultsContent');
+            const lookupBtn = document.getElementById('lookupBtn');
+
+            errorBanner.classList.add('hidden');
+            resultsContent.classList.add('hidden');
+            emptyState.classList.remove('hidden');
+
+            if (!target) {
+                errorBanner.textContent = 'Please enter an IP address or domain.';
+                errorBanner.classList.remove('hidden');
+                return;
+            }
+
+            lookupBtn.disabled = true;
+            lookupBtn.classList.add('opacity-60');
+            lookupBtn.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px;"></div> Looking up...`;
+            emptyState.innerHTML = `<div class="spinner" style="width:40px;height:40px;"></div>`;
+
+            try {
+                const url = `http://127.0.0.1:8000/api/toolbox/?tool=reverse_ip&target=${encodeURIComponent(target)}`;
+                const response = await fetch(url);
+
+                if (!response.ok) {
+                    throw new Error(`Server responded with status ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                if (data.status !== 'success') {
+                    errorBanner.textContent = data.message || 'Reverse IP lookup failed for an unknown reason.';
+                    errorBanner.classList.remove('hidden');
+                    resetEmptyState();
+                    return;
+                }
+
+                const r = data.result;
+                lastResult = r;
+
+                document.getElementById('resultsHeader').textContent = `Domains on ${r.ip} (${r.domain_count})`;
+                document.getElementById('resultsBody').innerHTML = r.domains.map((d, i) => `
+                    <tr>
+                        <td class="row-index">${i + 1}</td>
+                        <td class="mono-cell">${esc(d)}</td>
+                    </tr>`).join('');
+
+                emptyState.classList.add('hidden');
+                resultsContent.classList.remove('hidden');
+
+            } catch (error) {
+                errorBanner.textContent = `Connection failed: could not reach the Django API. Details: ${error.message}`;
+                errorBanner.classList.remove('hidden');
+                resetEmptyState();
+            } finally {
+                lookupBtn.disabled = false;
+                lookupBtn.classList.remove('opacity-60');
+                lookupBtn.innerHTML = `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg> Lookup`;
+            }
+        }
+
+        function resetEmptyState() {
+            const emptyState = document.getElementById('emptyState');
+            emptyState.innerHTML = `
+                <svg class="w-16 h-16 text-gray-700 mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                </svg>
+                <p class="text-gray-400 text-lg">Enter an IP address above.</p>`;
+        }
+
+        function exportDomains() {
+            if (!lastResult) return;
+            const text = lastResult.domains.join('\n');
+            const blob = new Blob([text], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `reverse-ip-${lastResult.ip}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        document.getElementById('targetInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') performReverseIpLookup();
+        });
+    </script>
+
+    <script>
+    /* === CoreRipper nav auth state (shared) === */
+    (function () {
+        var loginEl = document.getElementById('navLogin');
+        var ctaEl = document.getElementById('navCta');
+        if (!loginEl || !ctaEl) return;
+        var user = null;
+        try { user = JSON.parse(localStorage.getItem('coreripperUser') || 'null'); } catch (e) {}
+        var token = localStorage.getItem('coreripperToken');
+        if (!token || !user || !user.email) return;
+        loginEl.textContent = user.email.split('@')[0];
+        loginEl.title = user.email;
+        loginEl.href = user.is_admin ? '../admin.html' : '#';
+        if (!user.is_admin) loginEl.style.cursor = 'default';
+        ctaEl.textContent = 'Log out';
+        ctaEl.onclick = function () {
+            localStorage.removeItem('coreripperToken');
+            localStorage.removeItem('coreripperUser');
+            window.location.reload();
+        };
+    })();
+    </script>
+</body>
+</html>

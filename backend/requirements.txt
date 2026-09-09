@@ -1,0 +1,63 @@
+# Django and core framework
+Django==6.0.6
+psycopg2-binary==2.9.9
+
+# Django extensions
+django-celery-beat>=2.7.0
+django-cors-headers==4.3.1
+django-redis==5.4.0
+
+# Cache and task queue
+redis==5.0.1
+celery==5.3.4
+
+# API and HTTP utilities
+requests==2.31.0
+python-dotenv==1.0.0
+
+# DNS and network tools
+dnspython==2.4.2
+whois==0.9.7
+ipwhois>=1.3.0
+python-whois==0.8.0
+manuf==1.1.5
+ipaddress==1.0.23
+
+# HTML/XML parsing
+beautifulsoup4==4.12.2
+feedparser==6.0.10
+
+# Data processing and validation
+pydantic==2.5.0
+numpy==1.26.3
+
+# Cryptography and security
+google-auth==2.26.1
+cryptography==41.0.7
+
+# Image processing and search (for hardware/news image pipeline)
+pillow==10.1.0
+
+# Google APIs (for image search and OAuth)
+google-api-python-client==2.107.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+
+# Anthropic/Claude API
+anthropic==0.25.1
+
+# Payment gateway (Lenco)
+# Note: Lenco does not have an official Python SDK; requests is used instead
+
+# PDF generation (core/pdf.py: invoices + Workbench reports)
+reportlab==5.0.0
+
+# Production WSGI server (not needed for local `manage.py runserver`)
+gunicorn==23.0.0
+
+# Optional: For WhatsApp integration (if deploying the bot)
+# whatsapp-web.js requires Node.js, not Python; the bot is separate
+
+# Testing (optional, can move to a separate test-requirements.txt)
+pytest==7.4.3
+pytest-django==4.7.0

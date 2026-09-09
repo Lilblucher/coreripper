@@ -1,0 +1,1906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    
+    <script>
+    window.CR_API_BASE = (function () {
+        var loc = window.location;
+        // Opened straight off disk (file://) -- no origin to inherit.
+        if (!loc.hostname) return 'http://127.0.0.1:8000';
+        // Local dev: the static pages are served on their own port
+        // (_nocache_server.py on 5501, Live Server on 5500) while Django runs
+        // on 8000. Derived from the current host so it also works when Django
+        // itself serves the page on :8000.
+        if (loc.hostname === 'localhost' || loc.hostname === '127.0.0.1' || loc.hostname === '[::1]') {
+            return loc.protocol + '//' + loc.hostname + ':8000';
+        }
+        // Production: the API is served from the same origin as the site.
+        return loc.origin;
+    })();
+    </script>
+
+    <script>
+    (function () {
+        var IDLE_LIMIT_MS = 30 * 60 * 1000;  // hard idle cutoff
+        var IDLE_WARN_MS  = 2 * 60 * 1000;   // warn this long before the cutoff
+        var TICK_MS       = 5000;            // heartbeat + idle check cadence
+        // Background tabs get their timers throttled to roughly one tick a
+        // minute, so the heartbeat must be allowed to go well over a minute
+        // stale before we call it a closed browser.
+        var TAB_GRACE_MS  = 90 * 1000;
+        var LOGIN_URL     = '../login.html';
+
+        var K_TOKEN   = 'coreripperToken',
+            K_USER    = 'coreripperUser',
+            K_REFRESH = 'coreripperRefreshToken',
+            K_EXPIRY  = 'coreripperTokenExpiresAt',
+            K_ACTIVE  = 'coreripperLastActivity',
+            K_BEAT    = 'coreripperHeartbeat',
+            K_ENDED   = 'coreripperSessionEnded',
+            K_TAB     = 'coreripperTabAlive';
+
+        function get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+        function set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+        function del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+        function now() { return Date.now(); }
+
+        function clearSession() {
+            del(K_TOKEN); del(K_USER); del(K_REFRESH); del(K_EXPIRY);
+            del(K_ACTIVE); del(K_BEAT);
+        }
+        function stamp() { set(K_ACTIVE, String(now())); set(K_BEAT, String(now())); }
+        function storeSession(data) {
+            if (data.token) set(K_TOKEN, data.token);
+            if (data.token_expires_at) set(K_EXPIRY, data.token_expires_at);
+            if (data.refresh_token) set(K_REFRESH, data.refresh_token);
+            del(K_ENDED);
+            stamp();
+        }
+        function revoke() {
+            var token = get(K_TOKEN), refresh = get(K_REFRESH);
+            clearSession();
+            try {
+                var headers = { 'Content-Type': 'application/json' };
+                if (token) headers['Authorization'] = 'Bearer ' + token;
+                fetch(window.CR_API_BASE + '/api/accounts/logout/', {
+                    method: 'POST',
+                    keepalive: true,
+                    headers: headers,
+                    body: JSON.stringify({ refresh_token: refresh || '' })
+                }).catch(function () {});
+            } catch (e) { /* revocation is best-effort; local state is already cleared */ }
+        }
+        function endSession(reason) {
+            set(K_ENDED, reason);   // tells the other open tabs why they're being bounced
+            revoke();
+            hideWarning();
+            window.location.href = LOGIN_URL + '?reason=' + reason;
+        }
+        window.CoreRipperAuth = { store: storeSession, logout: revoke, touch: stamp };
+
+        // --- did the whole browser close since this session was last used? ---
+        var freshTab = false;
+        try {
+            freshTab = !sessionStorage.getItem(K_TAB);
+            sessionStorage.setItem(K_TAB, '1');
+        } catch (e) { /* storage blocked: treat as a continuing tab, never log out blindly */ }
+        var sawToken = !!get(K_TOKEN);
+        if (freshTab && sawToken && !get(K_REFRESH)) {
+            var beatAt = parseInt(get(K_BEAT) || '0', 10);
+            if (!beatAt || now() - beatAt > TAB_GRACE_MS) {
+                // No Remember-Me and no other live tab: the browser was closed.
+                revoke();
+                sawToken = false;
+            }
+        }
+        // A page load is real activity -- this is also what stops a remembered
+        // session from idling out on the time the browser spent closed.
+        if (get(K_TOKEN)) stamp();
+
+        // --- idle warning modal ---
+        var warnEl = null, warnCount = null, warned = false, countTimer = null;
+        function buildWarning() {
+            if (!document.body) return null;
+            var el = document.createElement('div');
+            el.id = 'crIdleModal';
+            el.setAttribute('role', 'dialog');
+            el.setAttribute('aria-modal', 'true');
+            el.setAttribute('aria-labelledby', 'crIdleTitle');
+            el.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;' +
+                'justify-content:center;padding:16px;background:rgba(3,7,18,.78);' +
+                'font-family:Space Grotesk,Inter,system-ui,-apple-system,sans-serif;';
+            el.innerHTML =
+                '<div style="max-width:400px;width:100%;background:#0f1115;border:1px solid rgba(37,151,232,.35);' +
+                'border-radius:14px;padding:26px 24px;box-shadow:0 24px 60px rgba(0,0,0,.6);color:#e5e7eb;text-align:center;">' +
+                  '<svg viewBox="0 0 24 24" fill="none" stroke="#2597e8" stroke-width="1.6" stroke-linecap="round" ' +
+                  'stroke-linejoin="round" style="width:38px;height:38px;margin:0 auto 12px;display:block;">' +
+                    '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>' +
+                  '<h2 id="crIdleTitle" style="margin:0 0 8px;font-size:19px;font-weight:700;color:#fff;">Are you still there?</h2>' +
+                  '<p style="margin:0;font-size:14px;line-height:1.55;color:#9ca3af;">' +
+                    "You've been inactive for a while. For your security we'll sign you out in " +
+                    '<span id="crIdleCount" style="color:#2597e8;font-weight:700;font-variant-numeric:tabular-nums;">2:00</span>.</p>' +
+                  '<div style="display:flex;gap:10px;margin-top:20px;">' +
+                    '<button type="button" id="crIdleStay" style="flex:1;padding:11px 12px;border:0;border-radius:9px;' +
+                    'background:#2597e8;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Stay signed in</button>' +
+                    '<button type="button" id="crIdleOut" style="flex:1;padding:11px 12px;border:1px solid #2a2f3a;' +
+                    'border-radius:9px;background:transparent;color:#9ca3af;font-size:14px;font-weight:600;cursor:pointer;' +
+                    'font-family:inherit;">Log out now</button>' +
+                  '</div>' +
+                '</div>';
+            document.body.appendChild(el);
+            warnCount = el.querySelector('#crIdleCount');
+            el.querySelector('#crIdleStay').addEventListener('click', function () {
+                warned = false;
+                lastWrite = now();
+                stamp();
+                hideWarning();
+            });
+            el.querySelector('#crIdleOut').addEventListener('click', function () {
+                endSession('signed_out');
+            });
+            return el;
+        }
+        function paintCountdown() {
+            if (!warnCount) return;
+            var left = Math.max(0, IDLE_LIMIT_MS - (now() - (parseInt(get(K_ACTIVE) || '0', 10))));
+            warnCount.textContent = Math.floor(left / 60000) + ':' +
+                ('0' + Math.floor((left % 60000) / 1000)).slice(-2);
+            if (left <= 0) endSession('timeout');
+        }
+        function showWarning() {
+            if (!warnEl) warnEl = buildWarning();
+            if (!warnEl) return;
+            warned = true;
+            warnEl.style.display = 'flex';
+            paintCountdown();
+            if (!countTimer) countTimer = setInterval(paintCountdown, 1000);
+            var stay = warnEl.querySelector('#crIdleStay');
+            if (stay) stay.focus();
+        }
+        function hideWarning() {
+            warned = false;
+            if (countTimer) { clearInterval(countTimer); countTimer = null; }
+            if (warnEl) warnEl.style.display = 'none';
+        }
+
+        // --- activity tracking (shared across tabs via localStorage) ---
+        var lastWrite = 0;
+        function onActivity() {
+            if (warned) return;   // the warning has to be dismissed deliberately
+            if (!get(K_TOKEN)) return;
+            var t = now();
+            if (t - lastWrite < 10000) return;   // one storage write per 10s at most
+            lastWrite = t;
+            stamp();
+        }
+        var events = ['mousedown', 'mousemove', 'keydown', 'input', 'wheel', 'touchstart', 'scroll', 'click'];
+        for (var i = 0; i < events.length; i++) {
+            window.addEventListener(events[i], onActivity, { passive: true, capture: true });
+        }
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) onActivity();
+        });
+
+        setInterval(function () {
+            var token = get(K_TOKEN);
+            if (token) sawToken = true;
+            if (!token) {
+                hideWarning();
+                // Another tab ended the shared session -- follow it out.
+                if (sawToken && get(K_ENDED)) {
+                    window.location.href = LOGIN_URL + '?reason=' + get(K_ENDED);
+                }
+                return;
+            }
+            set(K_BEAT, String(now()));   // liveness only; NOT activity
+            var last = parseInt(get(K_ACTIVE) || '0', 10);
+            if (!last) { stamp(); return; }
+            var idle = now() - last;
+            if (idle >= IDLE_LIMIT_MS) { endSession('timeout'); return; }
+            if (idle >= IDLE_LIMIT_MS - IDLE_WARN_MS) showWarning();
+            else if (warned) hideWarning();   // activity in another tab reset the clock
+        }, TICK_MS);
+
+        // --- token renewal off the Remember-Me refresh token ---
+        var refresh = get(K_REFRESH);
+        if (!refresh) return;
+        var expiryRaw = get(K_EXPIRY);
+        var expiry = expiryRaw ? Date.parse(expiryRaw) : 0;
+        var expired = !get(K_TOKEN) || !expiry || expiry <= now();
+        // Renew inside the last 90 minutes so an open session never actually
+        // lapses mid-use; a fully expired one is restored and the page rebooted.
+        if (!expired && expiry - now() > 90 * 60 * 1000) return;
+        fetch(window.CR_API_BASE + '/api/accounts/refresh/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh_token: refresh })
+        }).then(function (res) {
+            if (res.status === 400 || res.status === 401) {
+                // Dead refresh token. Only clear if another tab hasn't already
+                // rotated it (two tabs can race the same single-use token).
+                if (get(K_REFRESH) === refresh) {
+                    del(K_REFRESH);
+                    if (expired) clearSession();
+                }
+                return null;
+            }
+            return res.ok ? res.json() : null;
+        }).then(function (data) {
+            if (!data || !data.token) return;
+            storeSession(data);
+            if (expired) window.location.reload();
+        }).catch(function () {});
+    })();
+    </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grammar & Clarity Checker - CoreRipper | AI Tools</title>
+    <link rel="icon" href="../assets/logo/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="../assets/logo/favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="../assets/logo/favicon-16.png" sizes="16x16" type="image/png">
+    <link rel="apple-touch-icon" href="../assets/logo/apple-touch-icon-180.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { font-family: 'Space Grotesk', 'Inter', sans-serif; scroll-behavior: smooth; }
+        body { background-color: #0a0a0a; color: #e5e7eb; }
+        .gradient-text {
+            background: #2597e8;
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        }
+        .nav-link { color: #d1d5db; transition: color 0.3s ease; position: relative; }
+        .nav-link:hover, .nav-link.active { color: #2597E8; }
+        .nav-link::after { content: ''; position: absolute; left: 0; right: 100%; bottom: -6px; height: 2px; background: currentColor; transition: right 220ms ease-out; }
+        .nav-link:hover::after, .nav-link.active::after { right: 0; }
+        .cta-btn { background: #2597e8; transition: all 0.3s ease; }
+        .cta-btn:hover:not(:disabled) { box-shadow: 0 4px 0 rgba(0,0,0,0.45); transform: translateY(-2px) scale(1.03); }
+        .cta-btn:active:not(:disabled) { transform: scale(0.98); }
+        .cta-btn:disabled { cursor: not-allowed; opacity: 0.6; }
+        .icon-box { width: 48px; height: 48px; border-radius: 12px; background: #141414;
+            border: 1.5px solid #2597E855; display: flex; align-items: center; justify-content: center; color: #2597E8; }
+        .icon-box.w-10 { width: 40px; height: 40px; }
+
+        .code-area { background: #050505; font-family: 'Courier New', monospace; font-size: 0.9rem; border: 1px solid #1f2937; }
+        .code-area:focus { outline: none; border-color: #2597E8; box-shadow: 0 0 0 3px rgba(37,151,232,0.15); }
+
+        .error-banner { border: 1px solid rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.08); color: #f87171; border-radius: 0.75rem; padding: 1rem 1.25rem; font-size: 0.9rem; }
+        .badge-free {
+            display: inline-flex; align-items: center; gap: 0.3rem; font-size: 0.68rem; font-weight: 700;
+            padding: 0.22rem 0.65rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.03em;
+            background: rgba(16,185,129, 0.12); color: #10b981; border: 1px solid rgba(16,185,129, 0.3);
+        }
+        .success-badge {
+            display: inline-flex; align-items: center; gap: 0.35rem;
+            color: #10b981; background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.3);
+            padding: 0.2rem 0.7rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
+        }
+
+        .upload-zone { border: 2px dashed #374151; border-radius: 0.75rem; padding: 1.25rem; text-align: center; cursor: pointer; transition: all 200ms ease; background: rgba(255,255,255,0.01); }
+        .upload-zone:hover, .upload-zone.dragover { border-color: #2597E8; background: rgba(37,151,232,0.05); }
+        .upload-zone input[type="file"] { display: none; }
+        .upload-filename { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; background: #0d0d0d; border: 1px solid #374151; border-radius: 0.5rem; padding: 0.6rem 1rem; font-size: 0.85rem; color: #d1d5db; margin-top: 0.75rem; }
+        .upload-filename .remove-file { cursor: pointer; color: #6b7280; flex-shrink: 0; }
+        .upload-filename .remove-file:hover { color: #f87171; }
+
+        .highlight-view { white-space: pre-wrap; word-break: break-word; line-height: 1.7; }
+        .issue-mark { border-bottom: 2px solid #f87171; background: rgba(248,113,113,0.08); border-radius: 2px; cursor: pointer; }
+        .issue-mark.category-typo { border-bottom-color: #fbbf24; background: rgba(251,191,36,0.08); }
+        .issue-mark.category-style { border-bottom-color: #15A6DE; background: rgba(21,166,222,0.08); }
+
+        .issue-card { border: 1px solid #1f2937; border-radius: 0.75rem; padding: 0.9rem 1rem; margin-bottom: 0.75rem; background: #0d0d0d; }
+        .issue-card:last-child { margin-bottom: 0; }
+        .issue-replacement { display: inline-flex; align-items: center; gap: 0.3rem; background: rgba(16,185,129,0.1); color: #10b981; border: 1px solid rgba(16,185,129,0.3); padding: 0.2rem 0.6rem; border-radius: 0.4rem; font-size: 0.82rem; font-weight: 600; cursor: pointer; margin: 0.2rem 0.3rem 0 0; }
+        .issue-replacement:hover { background: rgba(16,185,129,0.2); }
+
+        .tool-nav-link { color: #2597E8; font-weight: 600; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 0.4rem; transition: opacity 0.2s ease; position: relative; }
+        .tool-nav-link:hover { opacity: 0.8; }
+
+        a:focus-visible, button:focus-visible, textarea:focus-visible {
+            outline: 2px solid #2597E8; outline-offset: 2px; border-radius: 4px;
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
+        }
+
+        /* Light Mode Overrides */
+        body.light-mode { background-color: #f3f4f6; color: #1f2937; }
+        body.light-mode nav { background-color: rgba(255, 255, 255, 0.8); border-color: #e5e7eb; }
+        body.light-mode .nav-link { color: #4b5563; }
+        body.light-mode .nav-link:hover, body.light-mode .nav-link.active { color: #2597E8; }
+        body.light-mode .border-gray-800 { border-color: #e5e7eb; }
+        body.light-mode .text-gray-400 { color: #4b5563; }
+        body.light-mode .text-gray-500 { color: #6b7280; }
+        body.light-mode h1, body.light-mode h2, body.light-mode h3 { color: #111827; }
+        body.light-mode .bg-black\/40 { background-color: #f9fafb; }
+        body.light-mode .code-area { background: #ffffff; color: #111827; border-color: #d1d5db; }
+        body.light-mode .upload-filename { background: #ffffff; border-color: #d1d5db; }
+        body.light-mode .issue-card { background: #ffffff; border-color: #d1d5db; }
+    
+        /* === CoreRipper Logo Animation (shared) === */
+        .cr-logo { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; }
+        .cr-logo-tile {
+            width: 40px; height: 40px; border-radius: 12px;
+            background: linear-gradient(180deg, #17171c 0%, #0f0f13 100%) padding-box,
+                        linear-gradient(135deg, #2597E8 0%, #15A6DE 100%) border-box;
+            border: 1.5px solid transparent;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .cr-icon-wrap { display: flex; align-items: center; justify-content: center; animation: cr-breathe 2.6s ease-in-out 1.6s infinite; }
+        .cr-wordmark { display: inline-flex; align-items: baseline; font-size: 22px; font-weight: 800; letter-spacing: -0.02em; color: #e5e7eb; }
+        .cr-word-core { display: inline-block; color: #e5e7eb; animation: cr-core-in .45s ease-out .08s both; }
+        .cr-word-ripper-wrap { position: relative; display: inline-block; }
+        .cr-word-ripper-wrap .cr-half { display: inline-block; background: #2597e8; -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .cr-word-ripper-wrap .cr-half.top { clip-path: polygon(0% 0%, 100% 0%, 100% 34%, 62% 46%, 30% 54%, 0% 64%); animation: cr-rip-top .5s cubic-bezier(.2,.9,.3,1) .84s both; }
+        .cr-word-ripper-wrap .cr-half.bottom { position: absolute; left: 0; top: 0; clip-path: polygon(0% 64%, 30% 54%, 62% 46%, 100% 34%, 100% 100%, 0% 100%); animation: cr-rip-bottom .5s cubic-bezier(.2,.9,.3,1) .84s both; }
+        .cr-rip-streak { position: absolute; left: -6%; top: 47%; width: 0; height: 3px; border-radius: 2px; background: #15a6de; box-shadow: 0 4px 0 rgba(0,0,0,0.45); transform: rotate(-6deg); transform-origin: left center; animation: cr-rip-streak .45s ease-out .76s both; }
+
+        .cr-hex { stroke-dasharray: 1; stroke-dashoffset: 1; opacity: .5; animation: cr-draw-hex .55s cubic-bezier(.4,0,.2,1) 0s both, cr-hex-out .18s .68s forwards; }
+        .cr-frame { opacity: 0; animation: cr-frame-in .25s .68s both; }
+        .cr-frame.b { animation-delay: .74s; }
+        .cr-shard-a { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cr-shard-a .5s .68s both; }
+        .cr-shard-b { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cr-shard-b .5s .68s both; }
+        .cr-pulse { stroke-dasharray: 1; stroke-dashoffset: 1; animation: cr-draw-pulse .7s cubic-bezier(.16,1,.3,1) .72s both; }
+
+        @keyframes cr-draw-hex { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+        @keyframes cr-hex-out { to { opacity: 0; } }
+        @keyframes cr-frame-in { from { opacity: 0; } to { opacity: .45; } }
+        @keyframes cr-shard-a { 0% { opacity: 0; transform: none; } 20% { opacity: .55; } 100% { opacity: 0; transform: translate(4px, -5px) rotate(10deg); } }
+        @keyframes cr-shard-b { 0% { opacity: 0; transform: none; } 20% { opacity: .55; } 100% { opacity: 0; transform: translate(-4px, 5px) rotate(10deg); } }
+        @keyframes cr-draw-pulse { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+        @keyframes cr-core-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+        @keyframes cr-rip-top { 0% { opacity: 0; transform: translate(10px, -9px) rotate(2deg); } 60% { opacity: 1; transform: translate(-1px, 1px) rotate(-0.5deg); } 100% { opacity: 1; transform: none; } }
+        @keyframes cr-rip-bottom { 0% { opacity: 0; transform: translate(-10px, 9px) rotate(-2deg); } 60% { opacity: 1; transform: translate(1px, -1px) rotate(0.5deg); } 100% { opacity: 1; transform: none; } }
+        @keyframes cr-rip-streak { 0% { width: 0%; opacity: 0; } 15% { opacity: 1; } 80% { opacity: 1; } 100% { width: 116%; opacity: 0; } }
+        @keyframes cr-breathe {
+            0%, 100% { filter: drop-shadow(0 0 5px rgba(21,166,222,.45)) drop-shadow(0 0 2px rgba(37,151,232,.3)); }
+            50% { filter: drop-shadow(0 0 15px rgba(37,151,232,.85)) drop-shadow(0 0 5px rgba(21,166,222,.55)); }
+        }
+
+        .cr-splash {
+            position: fixed; inset: 0; z-index: 9999; background: #0a0a0a;
+            display: flex; align-items: center; justify-content: center; overflow: hidden;
+            opacity: 1; transition: opacity 0.4s ease-out;
+        }
+        .cr-splash.cr-splash-hide { opacity: 0; pointer-events: none; }
+        .cr-splash-glow {
+            position: absolute; inset: 0; pointer-events: none; opacity: 0;
+            background: none;
+            animation: cr-bg-glow-in 1s ease-out 2.1s forwards, cr-bg-glow-breathe 4s ease-in-out 3.1s infinite;
+        }
+        .cr-splash .cr-lockup { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+        .cr-splash .cr-icon-wrap {
+            position: relative;
+            animation: cr-load-glow 1.6s ease-in-out 1.42s forwards, cr-dim-idle 4s ease-in-out 3.02s infinite;
+        }
+        .cr-splash .cr-wordmark { font-size: 28px; }
+        @keyframes cr-load-glow {
+            0%   { filter: drop-shadow(0 0 6px rgba(21,166,222,.5)) drop-shadow(0 0 2px rgba(37,151,232,.3)); }
+            35%  { filter: drop-shadow(0 0 26px rgba(37,151,232,1)) drop-shadow(0 0 10px rgba(21,166,222,.9)); }
+            55%  { filter: drop-shadow(0 0 26px rgba(37,151,232,1)) drop-shadow(0 0 10px rgba(21,166,222,.9)); }
+            100% { filter: drop-shadow(0 0 3px rgba(21,166,222,.2)) drop-shadow(0 0 0px rgba(37,151,232,0)); }
+        }
+        @keyframes cr-dim-idle {
+            0%, 100% { filter: drop-shadow(0 0 3px rgba(21,166,222,.2)) drop-shadow(0 0 0px rgba(37,151,232,0)); }
+            50% { filter: drop-shadow(0 0 8px rgba(37,151,232,.45)) drop-shadow(0 0 2px rgba(21,166,222,.25)); }
+        }
+        @keyframes cr-bg-glow-in { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes cr-bg-glow-breathe {
+            0%, 100% { opacity: .7; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.06); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .cr-icon-wrap, .cr-hex, .cr-frame, .cr-shard-a, .cr-shard-b, .cr-pulse,
+            .cr-word-core, .cr-half.top, .cr-half.bottom, .cr-rip-streak {
+                animation: none !important;
+                opacity: 1 !important;
+            }
+            .cr-hex { display: none; }
+            .cr-frame { opacity: .45 !important; }
+            .cr-shard-a, .cr-shard-b { display: none; }
+            .cr-half.top, .cr-half.bottom { clip-path: none !important; }
+            .cr-rip-streak { display: none; }
+        }
+
+        body.light-mode .cr-word-core, body.light-mode .cr-wordmark { color: #0a0a0a; }
+    
+        /* ============ Footer ============ */
+        .cr-footer {
+            border-top: 1px solid rgba(255,255,255,0.07);
+            padding: 28px 32px 14px;
+            background: rgba(10,10,10,0.5);
+        }
+        .cr-footer-inner {
+            max-width: 1180px;
+            margin: 0 auto;
+        }
+        .cr-footer-grid {
+            display: grid;
+            grid-template-columns: 1.7fr 1fr 1fr 1fr 1fr;
+            gap: 24px;
+            margin-bottom: 16px;
+        }
+        .cr-footer-brand-col {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            min-width: 0;
+        }
+        .cr-footer-brand {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .cr-footer-name {
+            font-size: 14.5px;
+            font-weight: 700;
+            color: #e5e7eb;
+            letter-spacing: -0.02em;
+        }
+        .cr-footer-name .grad {
+            background: #2597E8;
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .cr-footer-blurb {
+            font-size: 12px;
+            line-height: 1.5;
+            color: #9ca3af;
+            margin: 0;
+            max-width: 320px;
+        }
+        .cr-footer-social {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .cr-footer-social a {
+            display: inline-flex;
+            color: #6b7280;
+            transition: color 0.2s ease;
+        }
+        .cr-footer-social a:hover {
+            color: #2597E8;
+        }
+        .cr-footer-col {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .cr-footer-col .head {
+            font-size: 12px;
+            font-weight: 600;
+            color: #e5e7eb;
+            margin-bottom: 2px;
+        }
+        .cr-footer-col a {
+            font-size: 12px;
+            color: #6b7280;
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+        .cr-footer-col a:hover {
+            color: #2597E8;
+        }
+        .cr-footer-bottom {
+            border-top: 1px solid rgba(255,255,255,0.07);
+            padding-top: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .cr-footer-bottom p {
+            font-size: 11.5px;
+            color: #6b7280;
+            margin: 0;
+        }
+        .cr-footer-links {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .cr-footer-links a {
+            font-size: 11.5px;
+            color: #6b7280;
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+        .cr-footer-links a:hover {
+            color: #2597E8;
+        }
+        @media (max-width: 900px) {
+            .cr-footer-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+            .cr-footer-brand-col {
+                grid-column: 1 / -1;
+            }
+        }
+        @media (max-width: 768px) {
+            .cr-footer {
+                padding: 22px 20px 12px;
+            }
+            .cr-footer-grid {
+                gap: 14px;
+                margin-bottom: 12px;
+                grid-template-columns: 1fr 1fr;
+            }
+            .cr-footer-bottom {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .cr-footer-links {
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+        }
+
+        .cr-nav-content-dd { position: relative; display: inline-flex; align-items: center; }
+.cr-nav-content-btn { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; cursor: pointer; font-family: inherit; padding: 0; }
+.cr-nav-content-menu { left: 0; right: auto; min-width: 150px; }
+.cr-nav-content-btn[aria-expanded="true"] .cr-dd-chevron { transform: rotate(180deg); }
+.cr-nav-dropdown { display: none; align-items: center; position: relative; }
+.cr-dd-btn { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 12px; color: #d1d5db; cursor: pointer; font-size: 13.5px; font-weight: 500; transition: border-color .2s, color .2s, background .2s; }
+.cr-dd-btn:hover { border-color: rgba(37,151,232,0.4); color: #f4f4f5; background: rgba(255,255,255,0.07); }
+.cr-dd-chevron { flex-shrink: 0; transition: transform .3s cubic-bezier(.4,0,.2,1); }
+.cr-dd-btn[aria-expanded="true"] .cr-dd-chevron { transform: rotate(180deg); }
+.cr-dd-menu { position: absolute; top: calc(100% + 10px); right: 0; min-width: 185px; background: #141414; border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; box-shadow: 0 20px 48px rgba(0,0,0,0.55); overflow: hidden; max-height: 0; opacity: 0; transition: max-height .35s cubic-bezier(.4,0,.2,1), opacity .25s ease, transform .3s cubic-bezier(.4,0,.2,1); transform: translateY(-8px); pointer-events: none; z-index: 100; }
+.cr-dd-menu.open { max-height: 380px; opacity: 1; transform: translateY(0); pointer-events: auto; }
+.cr-dd-email { padding: 11px 16px 9px; font-size: 11.5px; color: #6b7280; border-bottom: 1px solid rgba(255,255,255,0.07); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cr-dd-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 16px; background: none; border: none; color: #d1d5db; font-size: 13.5px; font-weight: 500; cursor: pointer; text-align: left; text-decoration: none; transition: background .15s, color .15s; font-family: inherit; }
+.cr-dd-item:hover { background: rgba(255,255,255,0.05); color: #f4f4f5; }
+.cr-dd-item.danger { color: #f87171; }
+.cr-dd-item.danger:hover { background: rgba(248,113,113,0.08); color: #fca5a5; }
+.cr-dd-divider { height: 1px; background: rgba(255,255,255,0.07); margin: 4px 0; }
+.cr-mobile-group-label { font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #6b7280; padding: 10px 10px 2px; }
+</style>
+<style>/* nav breakpoint raised to 1040px so links never cram */
+.cr-nav-links{display:none}
+.cr-menu-btn{display:none}
+@media (max-width:1039.98px){.cr-menu-btn{display:inline-flex !important}}
+@media (min-width:1040px){.cr-nav-links{display:flex}#crMobileMenu{display:none !important}}
+.cr-menu-btn{flex-direction:column;align-items:flex-start;justify-content:center;gap:4px;padding:8px}
+.cr-bar{display:block;width:20px;height:2px;background:currentColor;border-radius:2px;transform-origin:left center;transition:transform .35s cubic-bezier(.4,0,.2,1),width .35s cubic-bezier(.4,0,.2,1),opacity .25s ease}
+.cr-menu-btn.open .cr-bar1{transform:translate(2px,3px) rotate(45deg);width:12px}
+.cr-menu-btn.open .cr-bar2{opacity:0;transform:scaleX(0)}
+.cr-menu-btn.open .cr-bar3{transform:translate(10.5px,-0.5px) rotate(-45deg);width:12px}
+#crMobileMenu{display:flex;flex-direction:column;gap:4px;padding:0 24px;max-height:0;overflow:hidden;opacity:0;border-top:1px solid transparent;transition:max-height .4s cubic-bezier(.4,0,.2,1),opacity .35s ease,padding .4s cubic-bezier(.4,0,.2,1)}
+#crMobileMenu.open{max-height:80vh;overflow-y:auto;opacity:1;padding:12px 24px 16px;border-top-color:#1f2937}
+        /* === Glowing Page Header === */
+        .glow-header {
+            position: relative;
+            overflow: hidden;
+            background: radial-gradient(120% 140% at 20% -10%, rgba(37,151,232,0.28) 0%, rgba(21,166,222,0.10) 38%, rgba(0,0,0,0) 68%), #0a0a0a;
+        }
+        .glow-header::before {
+            content: "";
+            position: absolute;
+            top: -30%;
+            left: -5%;
+            width: 520px;
+            height: 520px;
+            background: radial-gradient(circle, rgba(37,151,232,0.45) 0%, rgba(37,151,232,0) 70%);
+            filter: blur(20px);
+            animation: glowFloat 9s ease-in-out infinite;
+            pointer-events: none;
+        }
+        .glow-header::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background-image: linear-gradient(rgba(37,151,232,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(37,151,232,0.06) 1px, transparent 1px);
+            background-size: 44px 44px;
+            mask-image: radial-gradient(80% 100% at 30% 0%, #000 0%, transparent 75%);
+        }
+        @keyframes glowFloat {
+            0%, 100% {
+                transform: translate(0, 0) scale(1);
+                opacity: 0.85;
+            }
+            50% {
+                transform: translate(60px, 30px) scale(1.15);
+                opacity: 1;
+            }
+        }
+        .glow-title {
+            font-family: 'Space Grotesk', sans-serif;
+            letter-spacing: -0.02em;
+            line-height: 1.05;
+            background: linear-gradient(120deg, #ffffff 0%, #cfe8fb 45%, #2597E8 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 40px rgba(37,151,232,0.25);
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .glow-header::before {
+                animation: none;
+            }
+        }
+
+    </style>
+    <style>
+    /* Cookie consent banner (site-wide) */
+    .cr-consent-banner { position: fixed; left: 0; right: 0; bottom: 0; z-index: 500; background: #0d0d0d; border-top: 1px solid rgba(255,255,255,0.1); padding: 1.1rem 1.5rem; display: none; }
+    .cr-consent-banner.open { display: block; }
+    .cr-consent-inner { max-width: 64rem; margin: 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; }
+    .cr-consent-text { flex: 1; min-width: 220px; font-size: 0.82rem; color: #9ca3af; line-height: 1.5; }
+    .cr-consent-text a { color: #2597E8; text-decoration: underline; }
+    .cr-consent-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+    .cr-consent-btn { font-size: 0.82rem; font-weight: 600; padding: 0.55rem 1.1rem; border-radius: 8px; cursor: pointer; white-space: nowrap; font-family: inherit; }
+    .cr-consent-btn-accept { background: #2597e8; color: #fff; border: none; }
+    .cr-consent-btn-accept:hover { opacity: 0.9; }
+    .cr-consent-btn-essential { background: transparent; color: #d1d5db; border: 1px solid #374151; }
+    .cr-consent-btn-essential:hover { border-color: #6b7280; color: #fff; }
+    body.light-mode .cr-consent-banner { background: #ffffff; border-top-color: #e5e7eb; }
+    body.light-mode .cr-consent-text { color: #4b5563; }
+    body.light-mode .cr-consent-btn-essential { color: #374151; border-color: #d1d5db; }
+    @media (max-width: 640px) { .cr-consent-inner { flex-direction: column; align-items: stretch; } .cr-consent-actions { justify-content: stretch; } .cr-consent-btn { flex: 1; } }
+    </style>
+
+<!-- CR_MOBILE_START do not hand-edit  regenerate with _mobile_sweep.py -->
+<style id="cr-mobile">
+/* ================================================================
+   CoreRipper mobile override layer (<=768px).
+   Keeps every desktop layout untouched; overrides only sizing,
+   spacing, tap targets and grid direction for phones. All
+   animations are preserved. Regenerate via _mobile_sweep.py.
+   ================================================================ */
+@media (max-width: 768px) {
+  html, body { max-width: 100vw; overflow-x: hidden; -webkit-text-size-adjust: 100%; }
+  body { font-size: 15px; line-height: 1.55; }
+
+  /* Kill horizontal overflow from any oversized child */
+  img, video, canvas, svg, iframe, table, pre, code { max-width: 100%; }
+  img, video, canvas, iframe { height: auto; }
+  pre, code, .mono-cell { overflow-x: auto; word-break: break-word; -webkit-overflow-scrolling: touch; }
+  table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* Standardize container padding site-wide */
+  main, .container, .max-w-7xl, .max-w-6xl, .max-w-5xl, .max-w-4xl,
+  .max-w-3xl, .max-w-2xl, .max-w-xl, .max-w-lg, .max-w-md, .max-w-sm {
+    padding-left: 16px !important; padding-right: 16px !important;
+    max-width: 100% !important;
+  }
+
+  /* Collapse all common multi-column grids to a single column */
+  .grid-cols-2, .grid-cols-3, .grid-cols-4, .grid-cols-5,
+  .md\:grid-cols-2, .md\:grid-cols-3, .md\:grid-cols-4,
+  .lg\:grid-cols-2, .lg\:grid-cols-3, .lg\:grid-cols-4,
+  .sm\:grid-cols-2, .sm\:grid-cols-3 {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Two-column layouts used site-wide (Workbench, hero splits) */
+  .cr-half { flex: 0 0 100% !important; width: 100% !important; max-width: 100% !important; }
+  .cr-frame, .cr-bar { flex-wrap: wrap !important; }
+
+  /* Nav / header: keep the site's own hamburger, hide desktop link row + top CTA.
+     support.html (and any other page following the same pattern) nests its
+     hamburger button *inside* .nav-links, so blindly hiding the whole
+     container took the hamburger down with it  leaving zero way to
+     navigate or reach the mobile menu on that page. Hide only the link
+     children, and force the hamburger back on regardless of which
+     container it's nested in. */
+  .cr-nav-links > *, .nav-links > a, .desktop-nav > * { display: none !important; }
+  .nav-links .cr-appshell-menu-btn, .nav-links .cr-menu-btn { display: inline-flex !important; }
+  nav .cta-btn, header .cta-btn, .site-header .cta-btn { display: none !important; }
+  .cr-nav, header nav, .site-header { padding-left: 12px !important; padding-right: 12px !important; }
+  .cr-menu-btn, #crMenuBtn, .hamburger, .mobile-menu-btn { display: inline-flex !important; }
+
+  /* Logged-in header overflow fix (2026-07-31): the credit chip + account
+     dropdown replace Login/Get Started once a user is signed in, but at
+     phone widths those two plus the hamburger plus the decorative search
+     icon never fit on one row  the username label (up to 130px on desktop)
+     pushed the hamburger button off-screen entirely, so a logged-in user on
+     mobile had no way to open the nav menu at all. Fix: drop the decorative
+     search icon, shrink the credit chip and truncate the username hard, and
+     pin the hamburger so it can never be squeezed out. */
+  nav svg[stroke="#9ca3af"], .ts-nav-right > svg,
+  nav button:has(> svg.anim-scan) { display: none !important; }
+  nav .flex.items-center.gap-4, nav .flex.items-center.gap-3 { gap: 6px !important; }
+  .ts-nav-right { gap: 8px !important; flex-wrap: nowrap !important; }
+  .cr-credit-chip { padding: 5px 8px !important; font-size: 12px !important; gap: 4px !important; }
+  .cr-credit-chip svg { width: 11px !important; height: 11px !important; }
+  .cr-nav-dropdown .cr-dd-btn {
+    padding: 5px 6px !important; gap: 3px !important; flex-shrink: 1 !important; min-width: 0 !important;
+  }
+  .cr-nav-dropdown .cr-dd-btn #navUserLabel, #navUserLabel {
+    max-width: 54px !important; font-size: 12px !important;
+  }
+  .cr-nav-dropdown .cr-dd-chevron { flex-shrink: 0 !important; width: 10px !important; height: 10px !important; }
+  .cr-menu-btn, .ts-menu-btn, #tsMenuBtn { flex-shrink: 0 !important; margin-left: 2px !important; }
+  #crCreditWrap, .cr-credit-wrap { flex-shrink: 1 !important; min-width: 0 !important; }
+
+  /* settings.html/billing.html/support.html's header carries a "Dashboard"
+     text link and a "Back to Site" button alongside the hamburger and
+     account dropdown  on top of the app-shell menu button, that's 4-5
+     interactive elements crammed in one row, wide enough to push the
+     account dropdown itself off the right edge of a phone screen entirely
+     (confirmed: navUserWrap rendered at x=402 on a 375px-wide viewport).
+     Both links duplicate destinations already one tap away (Workbench via
+     the dropdown, Home via the logo), so they're the ones to drop, not the
+     hamburger or the dropdown. */
+  .wb-nav-inner a[href="dashboard.html"], .wb-nav-inner .secondary-btn,
+  .wb-nav-inner .nav-back { display: none !important; }
+  .cr-appshell-menu-btn, #navUserWrap.cr-nav-dropdown { flex-shrink: 0 !important; }
+
+  /* Nav dropdowns on mobile: same as desktop (absolute below trigger),
+     just ensure they don't overflow the viewport. Closes on outside tap
+     via the script block below. */
+  .cr-dd-menu {
+    max-width: calc(100vw - 24px) !important;
+    max-height: 70vh !important; overflow-y: auto !important;
+    z-index: 9999 !important;
+  }
+  .cr-dd-menu .cr-dd-item {
+    padding: 12px 18px !important; font-size: 14px !important;
+  }
+  .cr-dd-menu .cr-dd-email {
+    padding: 8px 18px 4px !important; font-size: 12px !important;
+  }
+  .cr-dd-menu .cr-dd-divider { margin: 4px 14px !important; }
+  /* Dashboard's own user dropdown */
+  .wb-user-dropdown {
+    max-width: calc(100vw - 24px) !important;
+    max-height: 70vh !important; overflow-y: auto !important;
+    z-index: 9999 !important;
+  }
+  .wb-dd-item { padding: 12px 18px !important; font-size: 14px !important; }
+  /* Credit dropdown */
+  .cr-credit-menu {
+    max-width: calc(100vw - 24px) !important;
+    max-height: 70vh !important; overflow-y: auto !important;
+    z-index: 9999 !important;
+  }
+
+  /* Tap targets  minimum 40x40 for anything interactive in headers/menus.
+     Deliberately excludes plain footer text links: those get their own
+     compact sizing below (footer is a dense link list, not primary nav),
+     and forcing 40px per link there was bloating the footer's height. */
+  .cr-nav a, .cr-nav button, .nav-link, .cr-dd-item, .cr-menu-btn,
+  header a, header button, .site-header a, .site-header button
+  { min-height: 40px; display: inline-flex; align-items: center; }
+  button, .btn, [role="button"], input[type="submit"], input[type="button"] {
+    min-height: 40px; padding-top: 10px; padding-bottom: 10px;
+  }
+
+  /* Forms: full-width, 16px font (prevents iOS zoom-on-focus) */
+  input, select, textarea {
+    font-size: 16px !important; width: 100%; box-sizing: border-box;
+    min-height: 44px;
+  }
+  textarea { min-height: 96px; }
+  form .row, form .field-group { flex-direction: column !important; gap: 10px !important; }
+
+  /* Headings / hero */
+  h1 { font-size: clamp(24px, 6.5vw, 32px) !important; line-height: 1.2 !important; }
+  h2 { font-size: clamp(20px, 5.5vw, 26px) !important; line-height: 1.25 !important; }
+  h3 { font-size: clamp(17px, 4.6vw, 20px) !important; }
+  .hero, .hero-section, section.hero { padding-top: 32px !important; padding-bottom: 32px !important; }
+
+  /* Cards / tool cards  tighter on phones */
+  .card, .tool-card, .ts-card, .ts-price-card, .ts-newscard, .ts-chipcard,
+  .cr-card, .s-card {
+    padding: 16px !important; border-radius: 12px !important;
+  }
+
+  /* ================================================================
+     Tool hub pages (net_tools / dev_tools / ai_tools)
+     ================================================================ */
+  /* Tool cards  compact layout on phones: smaller icon, tighter spacing */
+  .tool-card .icon-box { width: 40px !important; height: 40px !important; border-radius: 10px !important; }
+  .tool-card .icon-box svg { width: 20px !important; height: 20px !important; }
+  .tool-card h4 { font-size: 15px !important; }
+  .tool-card p { font-size: 13px !important; margin-bottom: 10px !important; }
+  .tool-card a { font-size: 13px !important; }
+  /* Badges (FREE / PREMIUM / COMING SOON / lock)  keep inline, don't overlap */
+  .badge { font-size: 0.65rem !important; padding: 0.15rem 0.5rem !important; }
+  .badge-soon { font-size: 0.6rem !important; }
+  .lock-badge, .tool-lock-badge { font-size: 10px !important; padding: 2px 7px !important; }
+  .upgrade-hint { font-size: 11px !important; }
+  /* net_tools.html's "Email/Domain Breach Check" card hardcodes its Coming
+     Soon badge as an inline `position:absolute; top:14px; right:14px` span
+     instead of using the .badge-soon class the other cards use  the other
+     cards' badges got caught by the rule above, this one didn't, and at
+     phone widths the card title wraps to two lines right under it, so the
+     badge sits on top of the word "Check". !important here beats the
+     inline style same as everywhere else in this stylesheet. */
+  .tool-card > span[style*="position:absolute"] {
+    position: static !important; display: inline-block !important;
+    margin: 0 0 10px !important;
+  }
+  /* Category sections  tighter accordion headers */
+  .category-toggle { padding: 14px 0 !important; }
+  .category-toggle h3 { font-size: 16px !important; }
+  /* Search bar on hub pages */
+  .search-wrap { margin-bottom: 20px !important; }
+  .search-wrap input { font-size: 15px !important; padding: 12px 14px !important; }
+  /* Tab buttons (DNS/SSL/Ping etc. on net_tools) */
+  .tab-btn { padding: 10px 12px !important; font-size: 13px !important; white-space: nowrap; }
+  /* Results area */
+  .result-card { padding: 14px !important; }
+  .result-label { font-size: 0.8rem !important; }
+  .result-value { font-size: 13px !important; }
+
+  /* ================================================================
+     Individual tool pages (networking/*, dev-tools/*, ai-tools/*)
+     ================================================================ */
+  /* Hero input area  full width, stack form elements */
+  .tool-hero, .tool-input-area, .input-section {
+    padding: 20px 14px !important;
+  }
+  /* Result panels + terminal output */
+  .result-panel, .output-panel, pre.result, .terminal, .code-output {
+    font-size: 12.5px !important; padding: 12px !important; border-radius: 10px !important;
+  }
+  /* Copy buttons inside result blocks */
+  .copy-btn, [data-copy], button[onclick*="copy"] {
+    font-size: 11px !important; padding: 4px 8px !important;
+  }
+
+  /* ================================================================
+     Content pages (blog / news / hardware)
+     ================================================================ */
+  /* Article card grids  these use Tailwind grids which are already collapsed,
+     but the cards themselves need tighter spacing */
+  .article-card, .news-card, .hw-card, .blog-card, .post-card {
+    padding: 14px !important; border-radius: 12px !important;
+  }
+  .article-card img, .news-card img, .hw-card img, .blog-card img {
+    border-radius: 10px !important; margin-bottom: 10px !important;
+  }
+  /* Filter/tag strips on content pages */
+  .filter-bar, .tag-bar, .content-filters {
+    overflow-x: auto !important; flex-wrap: nowrap !important;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    gap: 8px !important; padding-bottom: 4px;
+  }
+  .filter-bar::-webkit-scrollbar, .tag-bar::-webkit-scrollbar,
+  .content-filters::-webkit-scrollbar { display: none; }
+  /* Article detail pages  readable line length */
+  .article-body, .post-body, .post-content, .blog-content {
+    font-size: 15px !important; line-height: 1.7 !important;
+    padding: 0 !important;
+  }
+  .article-body h2, .post-body h2, .blog-content h2 { font-size: 20px !important; margin-top: 28px !important; }
+  .article-body h3, .post-body h3, .blog-content h3 { font-size: 17px !important; }
+  .article-body img, .post-body img { border-radius: 10px !important; }
+  .article-body pre, .post-body pre { font-size: 12px !important; padding: 12px !important; overflow-x: auto; }
+  /* Sidebar on content pages  collapse below main content */
+  .content-sidebar, .blog-sidebar, .article-sidebar {
+    position: static !important; width: 100% !important;
+    margin-top: 24px !important;
+  }
+
+  /* ================================================================
+     Account pages (settings / billing / support)
+     ================================================================ */
+  /* Section cards on settings/billing  full-width, no side padding excess */
+  .settings-card, .billing-card, .account-section, .support-card {
+    padding: 16px !important; border-radius: 12px !important;
+  }
+  /* Plan cards on billing  single column */
+  .plan-grid, .plans-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
+  /* Mobile money operator tiles (billing.html)  2 columns at most */
+  .pm-tiles { grid-template-columns: 1fr 1fr !important; gap: 8px !important; }
+  /* Payment form  stack amount/method fields */
+  .payment-form, .checkout-form { padding: 16px !important; }
+  .payment-row, .checkout-row { flex-direction: column !important; gap: 10px !important; }
+  /* Active sessions list on settings */
+  .session-row, .device-row {
+    flex-direction: column !important; align-items: flex-start !important;
+    gap: 6px !important; padding: 12px !important;
+  }
+  /* Support ticket form */
+  .ticket-form textarea { min-height: 120px !important; }
+
+  /* ================================================================
+     Pricing page
+     ================================================================ */
+  /* Price comparison cards  single column, compact */
+  .pricing-grid, .price-grid { grid-template-columns: 1fr !important; gap: 14px !important; }
+  .pricing-card, .price-card {
+    padding: 20px 16px !important; border-radius: 14px !important;
+  }
+  .pricing-card .price, .price-card .amount { font-size: 28px !important; }
+  /* Comparison table  horizontal scroll */
+  .comparison-table, .feature-table { display: block !important; overflow-x: auto !important; }
+  .comparison-table th, .comparison-table td { white-space: nowrap !important; font-size: 12px !important; padding: 8px 10px !important; }
+
+  /* ================================================================
+     Auth pages (login / signup / forgot / reset)
+     ================================================================ */
+  .auth-card, .cr-auth-card {
+    width: 100% !important; max-width: none !important;
+    margin: 16px auto !important; padding: 20px 16px !important;
+    border-radius: 14px !important;
+  }
+  .auth-card h1, .cr-auth-card h1 { font-size: 22px !important; }
+  .auth-card .auth-logo, .cr-auth-card .auth-logo { margin-bottom: 16px !important; }
+  /* Google sign-in button  full width */
+  .g_id_signin, [data-google-btn], .google-btn-wrap {
+    width: 100% !important; max-width: none !important;
+  }
+  /* Divider ("or") */
+  .auth-divider, .or-divider { margin: 16px 0 !important; }
+
+  /* ================================================================
+     Admin / Engine Room (admin.html)
+     ================================================================ */
+  .admin-tabs, .engine-tabs {
+    overflow-x: auto !important; flex-wrap: nowrap !important;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    gap: 4px !important;
+  }
+  .admin-tabs::-webkit-scrollbar, .engine-tabs::-webkit-scrollbar { display: none; }
+  .admin-tab, .engine-tab {
+    flex-shrink: 0 !important; font-size: 12px !important;
+    padding: 8px 12px !important; white-space: nowrap;
+  }
+  /* Admin cards/tables */
+  .admin-card, .engine-card { padding: 14px !important; border-radius: 12px !important; }
+  .admin-table, .engine-table { display: block !important; overflow-x: auto !important; font-size: 12px !important; }
+  .admin-table th, .admin-table td { padding: 6px 8px !important; white-space: nowrap !important; }
+  /* Moderation cards  stack image + content */
+  .mod-card { flex-direction: column !important; }
+  .mod-card img { width: 100% !important; max-height: 200px !important; object-fit: cover !important; border-radius: 10px !important; }
+
+  /* Homepage tool-showcase slideshow  keep the animation, cap the height */
+  .ts-viewport { height: auto !important; min-height: 340px; }
+  .ts-slide { padding: 22px 18px !important; }
+  .ts-slide-name { font-size: 17px !important; }
+  .ts-slide-desc { font-size: 13px !important; max-width: 100% !important; }
+  .ts-slide-icon { width: 40px !important; height: 40px !important; }
+  .ts-slide-icon svg { width: 22px !important; height: 22px !important; }
+
+  /* Homepage pricing / feature grids */
+  .ts-price-card { padding: 20px 18px !important; }
+  .ts-price-amount { font-size: 30px !important; }
+
+  /* Section paddings across the site */
+  section, .section, .ts-sec { padding-top: 36px !important; padding-bottom: 36px !important; }
+  .ts-sec-inner, section > .container, section > div { padding-left: 16px !important; padding-right: 16px !important; }
+
+  /* Footer  keep the site's own 2-col link grid (it's already mobile-tuned),
+     just tighten it further so it doesn't run long. Brand block always
+     spans the full row above the link columns. */
+  .cr-footer { padding: 20px 16px 10px !important; }
+  .cr-footer-grid {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    gap: 10px 16px !important;
+    margin-bottom: 10px !important;
+  }
+  .cr-footer-brand-col { grid-column: 1 / -1 !important; margin-bottom: 4px; }
+  .cr-footer-brand-col, .cr-footer-col { max-width: 100%; }
+  .cr-footer-col { gap: 4px !important; }
+  .cr-footer-col .head { font-size: 11px !important; margin-bottom: 2px !important; }
+  .cr-footer-col a { font-size: 13px !important; line-height: 1.5 !important; }
+  .cr-footer-blurb { font-size: 12.5px !important; margin: 2px 0 !important; }
+  footer .cr-footer-social { justify-content: flex-start !important; gap: 12px !important; }
+  /* Social icons are icon-only links  they still need a real tap target,
+     unlike the plain text links above. */
+  .cr-footer-social a { min-height: 40px !important; min-width: 40px !important; justify-content: center !important; }
+  .cr-footer-bottom { flex-direction: column !important; align-items: flex-start !important; padding-top: 10px !important; }
+  /* Non-.ts-* generic footer/grid containers elsewhere on the page still stack */
+  footer .grid:not(.cr-footer-grid) { grid-template-columns: 1fr !important; }
+
+  /* Cookie / consent banner  no bottom-right overlap of key UI */
+  .cr-consent-banner { left: 8px !important; right: 8px !important; bottom: 8px !important;
+    max-width: none !important; padding: 14px !important; border-radius: 12px !important; }
+  .cr-consent-inner, .cr-consent-actions { flex-direction: column !important; align-items: stretch !important; gap: 10px !important; }
+  .cr-consent-btn { width: 100% !important; }
+
+  /* Modals / dialogs */
+  .modal, .cr-modal, dialog, [role="dialog"] {
+    width: calc(100vw - 24px) !important; max-width: calc(100vw - 24px) !important;
+    max-height: calc(100vh - 24px) !important; overflow-y: auto !important;
+    padding: 18px !important; border-radius: 14px !important;
+  }
+
+  /* ================================================================
+     Dashboard / Workbench  comprehensive phone + tablet layout
+     ================================================================ */
+  /* Nav bar  compact, no overflow */
+  .wb-nav-inner {
+    padding: 0 12px !important; height: 54px !important; gap: 10px !important;
+  }
+  .wb-nav-inner .cr-logo { gap: 6px !important; }
+  .wb-nav-inner .cr-logo-tile { width: 28px !important; height: 28px !important; }
+  .wb-nav-inner .cr-logo-tile svg { width: 20px !important; height: 20px !important; }
+  .wb-nav-inner .cr-wordmark { font-size: 15px !important; }
+  /* Hide the "Workbench" title + plan pill filler block  scoped with :has()
+     to the one div that actually contains .wb-premium-pill, since settings/
+     billing/support also share the .wb-nav-inner class but put a completely
+     different 2nd child there (the Dashboard link + hamburger + Back to Site
+     + account-dropdown actions group). An un-scoped nth-child(2) previously
+     nuked that whole actions group on those three pages  including the only
+     way to open the account dropdown or log out on mobile. */
+  .wb-nav-inner > div:nth-child(2):has(.wb-premium-pill) { display: none !important; }
+  .wb-premium-pill { font-size: 10px !important; padding: 3px 8px !important; }
+  .wb-credits-pill { padding: 5px 8px !important; }
+  .wb-credits-pill .mono { font-size: 11px !important; }
+  #navRight { gap: 8px !important; }
+
+  /* Header band  tighter padding */
+  .wb-header-inner { padding: 20px 14px 0 !important; }
+  .wb-h1 { font-size: 22px !important; }
+  .wb-subtitle { font-size: 13px !important; }
+  .wb-tabs { gap: 18px !important; margin-top: 14px !important; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .wb-tabs::-webkit-scrollbar { display: none; }
+  .wb-tab-btn { font-size: 13px !important; white-space: nowrap; flex-shrink: 0; }
+
+  /* Run bar  stack vertically */
+  .wb-runbar-wrap { padding: 14px 12px 0 !important; }
+  .wb-runbar { padding: 14px !important; flex-direction: column !important; gap: 12px !important; border-radius: 12px !important; }
+  .wb-runbar > div, .wb-runbar > label { width: 100% !important; }
+  .wb-run-btn { width: 100% !important; text-align: center !important; }
+
+  /* Main 3-col grid  single column */
+  .wb-grid {
+    grid-template-columns: 1fr !important; padding: 14px 12px 80px !important; gap: 14px !important;
+  }
+  .wb-sidebar-col, .wb-rightrail-col {
+    position: static !important; max-height: none !important;
+    overflow-y: visible !important;
+  }
+  /* On phones, move sidebar (tool picker) above main stream */
+  .wb-sidebar-col { order: -1 !important; }
+
+  /* Cards  slightly tighter */
+  .wb-card { padding: 12px 14px !important; border-radius: 11px !important; }
+  .wb-result-card { padding: 14px !important; border-radius: 12px !important; }
+  .wb-result-card:hover { transform: none !important; }
+  .wb-card-head { gap: 8px !important; }
+
+  /* Tool picker  horizontal scroll strip instead of full sidebar list */
+  .wb-tool-row { padding: 7px 8px !important; font-size: 12px !important; }
+  .wb-add-row { flex-direction: column !important; }
+
+  /* Batch progress  wrap chips */
+  .wb-batch { padding: 12px 14px !important; border-radius: 11px !important; }
+  .wb-batch-head { gap: 8px !important; }
+  .wb-batch-chips { gap: 6px !important; }
+  .wb-batch-chip { font-size: 11px !important; }
+  .wb-batch-save-row { flex-direction: column !important; gap: 8px !important; align-items: stretch !important; }
+
+  /* Flat grid results (key-value pairs inside result cards) */
+  .wb-flat-grid { grid-template-columns: 1fr !important; gap: 8px !important; }
+
+  /* Tables inside results  stack into cards */
+  .wb-table-wrap { margin-bottom: 10px !important; }
+  .wb-table th { font-size: 10px !important; padding: 5px 6px !important; }
+  .wb-table td { font-size: 11.5px !important; padding: 5px 6px !important; white-space: normal !important; }
+
+  /* Diff rows  stack before/after */
+  .wb-diff-row { flex-direction: column !important; gap: 8px !important; }
+  .wb-diff-box { min-width: 0 !important; }
+
+  /* Stream filters  scrollable */
+  .wb-filters { overflow-x: auto !important; flex-wrap: nowrap !important; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 4px; }
+  .wb-filters::-webkit-scrollbar { display: none; }
+  .wb-filter-pill { flex-shrink: 0 !important; font-size: 11.5px !important; }
+
+  /* Actions row  wrap buttons */
+  .wb-actions-row { gap: 6px !important; }
+  .wb-btn-ghost, .wb-btn-primary { font-size: 11.5px !important; padding: 6px 10px !important; }
+
+  /* Saved Results view */
+  .wb-saved-wrap { padding: 16px 12px 80px !important; }
+  .wb-project-card { padding: 14px !important; }
+  .wb-project-row { gap: 8px !important; }
+  .wb-loose-row { padding: 10px 12px !important; gap: 8px !important; }
+
+  /* Floating Assistant  bottom-sheet (phones; tablet uses page's own 640px rule) */
+  .wb-assistant-panel {
+    left: 0 !important; right: 0 !important; bottom: 0 !important; top: auto !important;
+    width: 100% !important; height: 70vh !important; max-height: calc(100vh - 60px) !important;
+    border-radius: 18px 18px 0 0 !important; resize: none !important;
+  }
+  .wb-assistant-head { cursor: default !important; }
+  .wb-assistant-grip, .wb-assistant-resize { display: none !important; }
+  .wb-assistant-body { padding: 12px 14px !important; }
+  .wb-msg-bubble { max-width: 90% !important; font-size: 13px !important; }
+  .wb-assistant-input-row { padding: 10px 12px calc(env(safe-area-inset-bottom, 8px) + 10px) !important; }
+
+  /* FAB  smaller on phone, stay above bottom-sheet */
+  .wb-assistant-toggle { right: 14px !important; bottom: 14px !important; width: 46px !important; height: 46px !important; }
+
+  /* Monitors add-form inside right rail  full-width fields */
+  .wb-phone-wrap { border-radius: 8px !important; }
+  .wb-dial-dropdown { left: 12px !important; right: 12px !important; width: auto !important; max-width: none !important; }
+
+  /* Modal  full-width on phones */
+  .wb-modal { padding: 20px 16px !important; max-width: calc(100vw - 24px) !important; border-radius: 14px !important; }
+  .wb-toast { left: 12px !important; right: 12px !important; bottom: 16px !important; transform: none !important; text-align: center !important; }
+
+  /* Gate/access screens */
+  .wb-gate-wrap { min-height: 50vh !important; padding: 30px 16px !important; }
+
+  /* Empty state */
+  .wb-empty { padding: 36px 16px !important; }
+
+  /* New section button */
+  .wb-new-section { padding: 10px !important; font-size: 12px !important; }
+
+  /* Code blocks inside results  allow scroll */
+  .wb-code-text { font-size: 11.5px !important; padding-right: 40px !important; }
+
+  /* Tool pages  the tool nav rail collapses to a horizontal scroller */
+  .tool-nav, .tool-nav-list, .sidebar-tools {
+    display: flex !important; flex-direction: row !important; overflow-x: auto !important;
+    white-space: nowrap; gap: 8px !important; padding: 8px !important;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .tool-nav::-webkit-scrollbar { display: none; }
+  .tool-nav-link { flex: 0 0 auto !important; }
+
+  /* Result panels on tool pages */
+  .result-panel, .output-panel, pre.result, .terminal { font-size: 13px !important; }
+
+  /* Key/value result rows (subnet calc, SSL checker, JWT decoder, hash
+     generator, etc.)  stack label above value instead of forcing a fixed
+     label column that crushes the value into a sliver and, combined with
+     word-break:break-all, wraps it one character per line. */
+  .kv-row {
+    flex-direction: column !important; align-items: flex-start !important;
+    gap: 4px !important; padding: 10px 14px !important;
+  }
+  .kv-label { flex: none !important; width: 100% !important; font-weight: 600 !important; }
+  .kv-value { flex: none !important; width: 100% !important; }
+
+  /* Real multi-row results tables (.data-table  DNS propagation, MX/NS
+     lookup, port scanner, traceroute, etc.)  collapse into stacked cards
+     instead of a horizontally-scrolling grid. Relies on each <td> carrying
+     a data-label attribute matching its column header (see individual
+     tool pages' render functions). */
+  .data-table { display: block !important; width: 100% !important; border: none !important; }
+  .data-table thead { display: none !important; }
+  .data-table tbody, .data-table tr { display: block !important; width: 100% !important; }
+  .data-table tr {
+    margin-bottom: 10px !important; border: 1px solid rgba(255,255,255,0.08) !important;
+    border-radius: 10px !important; padding: 4px 12px !important;
+    background: rgba(255,255,255,0.02) !important;
+  }
+  .data-table td {
+    display: flex !important; justify-content: space-between !important; align-items: center !important;
+    gap: 12px !important; padding: 8px 0 !important; border-bottom: 1px solid rgba(255,255,255,0.06) !important;
+    text-align: right !important; white-space: normal !important;
+  }
+  .data-table tr td:last-child { border-bottom: none !important; }
+  .data-table td::before {
+    content: attr(data-label); font-weight: 600; color: #9ca3af; font-size: 0.72rem;
+    text-transform: uppercase; letter-spacing: 0.02em; flex: 0 0 auto; text-align: left; padding-right: 10px;
+  }
+  body.light-mode .data-table tr { border-color: rgba(0,0,0,0.08) !important; background: rgba(0,0,0,0.015) !important; }
+  body.light-mode .data-table td { border-bottom-color: rgba(0,0,0,0.06) !important; }
+  body.light-mode .data-table td::before { color: #6b7280; }
+
+  /* Auth pages (login/signup/forgot/reset) */
+  .auth-card, .cr-auth-card { width: 100% !important; max-width: 420px !important; margin: 24px auto !important; padding: 22px !important; }
+
+  /* Splash screen scale on small phones */
+  .cr-splash .cr-lockup { transform: scale(0.85); }
+
+  /* Long words / URLs shouldn't blow out cards */
+  p, li, td, dd, .card, .tool-card, .s-card { overflow-wrap: anywhere; }
+
+  /* Buttons never wrap to two lines from padding on narrow screens */
+  .btn, button { white-space: normal; }
+
+  /* Absolute-positioned decorative blobs often push scrollbars  contain them */
+  .decor, .bg-blob, .cr-blob, [data-decor] { max-width: 100vw; overflow: hidden; }
+
+  /* ---- Homepage (index.html) ts-* specific overrides ---- */
+  .ts-nav-inner { padding: 0 14px !important; height: 56px !important; }
+  .ts-nav-links, .ts-nav-right .ts-cta, .ts-nav-right .ts-btn-primary { display: none !important; }
+  .ts-menu-btn { display: inline-flex !important; }
+  .ts-hero, .ts-hero-inner { padding: 32px 16px 40px !important; }
+  .ts-hero-grid { grid-template-columns: 1fr !important; gap: 24px !important; }
+  .ts-search { padding: 32px 16px 40px !important; }
+  .ts-cats { padding: 40px 16px !important; }
+  .ts-cats-grid { grid-template-columns: 1fr !important; gap: 14px !important; }
+  .ts-sec { padding: 40px 16px !important; }
+  .ts-sec-head { flex-direction: column !important; align-items: flex-start !important; gap: 14px !important; }
+  .ts-footer { padding: 36px 16px 28px !important; }
+  .ts-footer-grid, .ts-footer-inner .grid { grid-template-columns: 1fr !important; gap: 22px !important; }
+  .ts-price-grid, .ts-features-grid, .ts-pillars-grid { grid-template-columns: 1fr !important; gap: 16px !important; }
+  .ts-wb-mock-side { display: none !important; }
+  .ts-wb-mock-main { width: 100% !important; }
+  .ts-mon-panel, .ts-chipcard { padding: 16px !important; }
+  .ts-slider-frame, .ts-window-wrap { max-width: 100% !important; }
+
+  /* Newsletter box  tighten padding/margins so the section doesn't eat a
+     full extra screen of scrolling on phones. */
+  .ts-newsletter-box { padding: 28px 18px !important; }
+  .ts-newsletter-box h2 { font-size: 24px !important; margin-bottom: 8px !important; }
+  .ts-newsletter-box p.sub { font-size: 14px !important; margin-bottom: 16px !important; }
+  .ts-newsletter-tags { margin-bottom: 16px !important; gap: 6px !important; }
+
+  /* Newsletter "already subscribed" banner  wrap instead of overlapping
+     the Subscribe/Unsubscribe button against the status text. */
+  .ts-newsletter-success {
+    flex-wrap: wrap !important; justify-content: center !important;
+    text-align: center !important; padding: 14px 18px !important;
+  }
+  #newsletterToggleBtn { margin-left: 0 !important; margin-top: 6px !important; }
+}
+
+/* --- Extra tightening for very small phones (<=480px) --- */
+@media (max-width: 480px) {
+  body { font-size: 14.5px; }
+  main, .container, .max-w-7xl, .max-w-6xl, .max-w-5xl, .max-w-4xl,
+  .max-w-3xl, .max-w-2xl { padding-left: 12px !important; padding-right: 12px !important; }
+  section, .section, .ts-sec { padding-top: 28px !important; padding-bottom: 28px !important; }
+  h1 { font-size: clamp(22px, 7vw, 28px) !important; }
+  .card, .tool-card, .ts-card, .ts-price-card, .cr-card, .s-card { padding: 16px !important; border-radius: 12px !important; }
+  .ts-viewport { min-height: 320px; }
+  .ts-slide { padding: 18px 14px !important; }
+  .ts-slide-name { font-size: 16px !important; }
+  .cr-splash .cr-lockup { transform: scale(0.75); }
+}
+
+/* --- Tablet portrait (481-768px): dashboard gets 2-col grid --- */
+@media (min-width: 481px) and (max-width: 768px) {
+  .wb-grid { grid-template-columns: 1fr 1fr !important; }
+  .wb-sidebar-col { grid-column: 1 / -1 !important; order: -1 !important; }
+  .wb-rightrail-col { grid-column: 1 / -1 !important; }
+  .wb-flat-grid { grid-template-columns: 1fr 1fr !important; }
+  .wb-runbar { flex-direction: row !important; flex-wrap: wrap !important; }
+  .wb-run-btn { width: auto !important; }
+}
+
+/* --- Smallest phones (<=360px, e.g. iPhone SE portrait) --- */
+@media (max-width: 360px) {
+  body { font-size: 14px; }
+  main, .container { padding-left: 10px !important; padding-right: 10px !important; }
+  h1 { font-size: 22px !important; }
+  h2 { font-size: 19px !important; }
+  .ts-slide { padding: 16px 12px !important; }
+  .ts-slide-icon { width: 36px !important; height: 36px !important; }
+  .cr-splash .cr-lockup { transform: scale(0.65); }
+}
+</style>
+<script>
+/* Dropdown close-on-outside-tap (2026-07-31).
+   Tap anywhere outside an open dropdown to close it. Works on both desktop
+   and mobile, for all three dropdown types on every page. */
+document.addEventListener('click', function (e) {
+  var sel = '.cr-dd-menu.open, .wb-user-dropdown.open, .cr-credit-menu.open';
+  var open = document.querySelector(sel);
+  if (!open) return;
+  if (open.contains(e.target)) return;
+  var wrap = open.closest('.cr-nav-dropdown, .wb-user-menu-wrap, .cr-credit-wrap');
+  if (wrap) {
+    var btn = wrap.querySelector('.cr-dd-btn, .wb-user-btn, .cr-credit-chip');
+    if (btn && btn.contains(e.target)) return;
+  }
+  open.classList.remove('open');
+  if (wrap) {
+    var b = wrap.querySelector('.cr-dd-btn, .wb-user-btn, .cr-credit-chip');
+    if (b) b.setAttribute('aria-expanded', 'false');
+  }
+});
+document.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  var sel = '.cr-dd-menu.open, .wb-user-dropdown.open, .cr-credit-menu.open';
+  var open = document.querySelector(sel);
+  if (!open) return;
+  open.classList.remove('open');
+  var wrap = open.closest('.cr-nav-dropdown, .wb-user-menu-wrap, .cr-credit-wrap');
+  var btn = wrap && wrap.querySelector('.cr-dd-btn, .wb-user-btn, .cr-credit-chip');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+});
+</script>
+<!-- CR_MOBILE_END -->
+</head>
+<body>
+    <div class="cr-consent-banner" id="crConsentBanner" role="dialog" aria-label="Cookie preferences">
+        <div class="cr-consent-inner">
+            <p class="cr-consent-text">We use essential cookies to run CoreRipper, and optional personalization/analytics/advertising cookies to remember things like your theme and improve the free tier. See our <a href="../cookie-policy.html">Cookie Policy</a>.</p>
+            <div class="cr-consent-actions">
+                <button class="cr-consent-btn cr-consent-btn-essential" id="crConsentEssential" type="button">Essential only</button>
+                <button class="cr-consent-btn cr-consent-btn-accept" id="crConsentAccept" type="button">Accept all</button>
+            </div>
+        </div>
+    </div>
+    <script>
+    /* === CoreRipper cookie consent (shared) ===
+     * Site has no shared bundle  copied verbatim into every page. Nothing
+     * else on the site reads document.cookie except this (and cr_theme,
+     * gated on personalization consent below); account/session state is a
+     * bearer token in localStorage, never a cookie. */
+    (function () {
+        var COOKIE_NAME = 'cr_consent';
+        var COOKIE_VERSION = '2';
+        var COOKIE_MAX_AGE_DAYS = 365;
+        var THEME_COOKIE_NAME = 'cr_theme';
+
+        function getCookie(name) {
+            var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+            return match ? decodeURIComponent(match[2]) : null;
+        }
+        function setCookie(name, value, maxAgeDays) {
+            var maxAge = maxAgeDays * 24 * 60 * 60;
+            document.cookie = name + '=' + encodeURIComponent(value) + '; max-age=' + maxAge + '; path=/; samesite=Lax';
+        }
+        function deleteCookie(name) {
+            document.cookie = name + '=; max-age=0; path=/; samesite=Lax';
+        }
+        function readConsent() {
+            var raw = getCookie(COOKIE_NAME);
+            if (!raw) return null;
+            try {
+                var parsed = JSON.parse(raw);
+                if (parsed.v !== COOKIE_VERSION) return null; // policy changed -> re-prompt
+                return parsed;
+            } catch (e) { return null; }
+        }
+        function writeConsent(personalization, analytics, advertising) {
+            setCookie(COOKIE_NAME, JSON.stringify({ v: COOKIE_VERSION, personalization: personalization, analytics: analytics, advertising: advertising, ts: Date.now() }), COOKIE_MAX_AGE_DAYS);
+            if (personalization) {
+                syncThemeCookieFromCurrentState();
+            } else {
+                deleteCookie(THEME_COOKIE_NAME);
+            }
+        }
+
+        // Theme persistence (personalization-gated). The toggle checkbox and
+        // its own change handler live in each page's own footer script;
+        // this only reads/writes the cookie so the choice survives reloads.
+        function syncThemeCookieFromCurrentState() {
+            setCookie(THEME_COOKIE_NAME, document.body.classList.contains('light-mode') ? 'light' : 'dark', COOKIE_MAX_AGE_DAYS);
+        }
+        function applyStoredTheme() {
+            var consent = readConsent();
+            if (!consent || !consent.personalization) return;
+            var stored = getCookie(THEME_COOKIE_NAME);
+            if (stored === 'light') document.body.classList.add('light-mode');
+            else if (stored === 'dark') document.body.classList.remove('light-mode');
+        }
+        applyStoredTheme();
+        document.addEventListener('DOMContentLoaded', function () {
+            var themeToggle = document.getElementById('theme-toggle');
+            if (!themeToggle) return;
+            themeToggle.checked = document.body.classList.contains('light-mode');
+            themeToggle.addEventListener('change', function () {
+                var consent = readConsent();
+                if (consent && consent.personalization) syncThemeCookieFromCurrentState();
+            });
+        });
+
+        var banner = document.getElementById('crConsentBanner');
+        function showBanner() { if (banner) banner.classList.add('open'); }
+        function hideBanner() { if (banner) banner.classList.remove('open'); }
+
+        window.CoreRipperConsent = {
+            get: readConsent,
+            has: function (kind) { var c = readConsent(); return !!(c && c[kind]); },
+            reopen: showBanner,
+        };
+
+        var acceptBtn = document.getElementById('crConsentAccept');
+        var essentialBtn = document.getElementById('crConsentEssential');
+        if (acceptBtn) acceptBtn.addEventListener('click', function () { writeConsent(true, true, true); hideBanner(); });
+        if (essentialBtn) essentialBtn.addEventListener('click', function () { writeConsent(false, false, false); hideBanner(); });
+
+        if (!readConsent()) showBanner();
+    })();
+    </script>
+    <div class="cr-splash" id="crSplash">
+      <div class="cr-splash-glow"></div>
+      <div class="cr-lockup" id="crSplashLockup">
+        <div class="cr-icon-wrap">
+          <svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="coreGradient-splash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+              <linearGradient id="pulseGradient-splash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+              <filter id="neonGlow-splash" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+            </defs>
+            <path class="cr-hex" d="M 32 6 L 52 18 L 52 46 L 32 58 L 12 46 L 12 18 Z" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" />
+            <path class="cr-frame" d="M 32 6 L 12 18 L 12 46 L 24 53" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+            <path class="cr-frame b" d="M 32 58 L 52 46 L 52 18 L 40 11" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+            <path class="cr-shard-a" d="M 32 6 L 40 11" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" />
+            <path class="cr-shard-b" d="M 32 58 L 24 53" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" />
+            <path class="cr-pulse" d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-splash)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-splash)" pathLength="1" />
+          </svg>
+        </div>
+        <div class="cr-wordmark">
+          <span class="cr-word-core">Core</span>
+          <span class="cr-word-ripper-wrap">
+            <span class="cr-half top">Ripper</span>
+            <span class="cr-half bottom">Ripper</span>
+            <span class="cr-rip-streak"></span>
+          </span>
+        </div>
+      </div>
+    </div>
+    <script src="../assets/logo/animated-favicon.js"></script>
+    <script>
+    (function () {
+      var splash = document.getElementById('crSplash');
+      if (!splash) return;
+      if (sessionStorage.getItem('crSplashPlayed')) { splash.remove(); return; }
+      sessionStorage.setItem('crSplashPlayed', '1');
+      var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (window.CoreRipperFavicon) { window.CoreRipperFavicon.init(); }
+      // Hold the splash for the full entrance+glow+dim sequence (~3.2s) even
+      // if the page itself loads faster, so the animation isn't cut short 
+      // but never hold *less* than actual load time if the page is slower.
+      var MIN_DISPLAY_MS = reduced ? 200 : 3200;
+      var mountedAt = performance.now();
+      var loaded = false;
+      function removeSplash() {
+        var elapsed = performance.now() - mountedAt;
+        var wait = Math.max(0, MIN_DISPLAY_MS - elapsed);
+        setTimeout(function () {
+          splash.classList.add('cr-splash-hide');
+          setTimeout(function () { splash.remove(); }, 450);
+        }, wait);
+      }
+      if (document.readyState === 'complete') {
+        removeSplash();
+      } else {
+        window.addEventListener('load', removeSplash);
+      }
+    })();
+    </script>
+    
+    <nav class="border-b border-gray-800 sticky top-0 z-50 backdrop-blur-md bg-black/80">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex items-center gap-3">
+                    <a href="../index.html" class="cr-logo">
+                    <div class="cr-logo-tile">
+                      <div class="cr-icon-wrap">
+                        <svg width="26" height="26" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <defs>
+                            <linearGradient id="coreGradient-nav" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                            <linearGradient id="pulseGradient-nav" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                            <filter id="neonGlow-nav" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+                          </defs>
+                          <path class="cr-hex" d="M 32 6 L 52 18 L 52 46 L 32 58 L 12 46 L 12 18 Z" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" />
+                          <path class="cr-frame" d="M 32 6 L 12 18 L 12 46 L 24 53" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+                          <path class="cr-frame b" d="M 32 58 L 52 46 L 52 18 L 40 11" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+                          <path class="cr-shard-a" d="M 32 6 L 40 11" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" />
+                          <path class="cr-shard-b" d="M 32 58 L 24 53" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" />
+                          <path class="cr-pulse" d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-nav)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-nav)" pathLength="1" />
+                        </svg>
+                      </div>
+                    </div>
+                    <div class="cr-wordmark">
+                      <span class="cr-word-core">Core</span>
+                      <span class="cr-word-ripper-wrap">
+                        <span class="cr-half top">Ripper</span>
+                        <span class="cr-half bottom">Ripper</span>
+                        <span class="cr-rip-streak"></span>
+                      </span>
+                    </div>
+                </a>
+                </div>
+                <div class="cr-nav-links gap-8">
+                <a href="../index.html" class="nav-link font-medium">Home</a>
+                <a href="../dev_tools.html" class="nav-link font-medium">Developer Tools</a>
+                <a href="../ai_tools.html" class="nav-link font-medium">AI Tools</a>
+                <a href="../net_tools.html" class="nav-link font-medium">Network Tools</a>
+                <a href="../pricing.html" class="nav-link font-medium">Pricing</a>
+            <div class="cr-nav-content-dd" id="navContentWrap">
+            <button type="button" class="nav-link font-medium cr-nav-content-btn" id="navContentBtn" aria-expanded="false" onclick="(function(){var d=document.getElementById('navContentMenu');var open=d.classList.toggle('open');this.setAttribute('aria-expanded',open);}).call(this)">
+                Discover
+                <svg class="cr-dd-chevron" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div class="cr-dd-menu cr-nav-content-menu" id="navContentMenu">
+                <a class="cr-dd-item" href="../blog.html">Blog</a>
+                <a class="cr-dd-item" href="../news.html">News</a>
+                <a class="cr-dd-item" href="../hardware.html">Hardware</a>
+            </div>
+            </div>
+                </div>
+                <div class="flex items-center gap-4">
+                    <a href="../dashboard.html" id="navWorkbench" style="display:none;" class="text-gray-400 hover:text-[#15A6DE] transition font-medium">Workbench</a>
+                    <a href="../login.html" class="text-gray-400 hover:text-[#15A6DE] transition font-medium" id="navLogin">Login</a>
+                    <button class="cta-btn px-6 py-2 rounded-lg font-semibold text-white" id="navCta" onclick="window.location.href='../signup.html'">Get Started</button>
+                    <button class="cr-menu-btn" aria-label="Toggle navigation menu" aria-expanded="false" style="background:none;border:none;cursor:pointer;color:#d1d5db;" onclick="var m=document.getElementById('crMobileMenu');var open=m.classList.toggle('open');this.classList.toggle('open',open);this.setAttribute('aria-expanded',open);"><span class="cr-bar cr-bar1"></span><span class="cr-bar cr-bar2"></span><span class="cr-bar cr-bar3"></span></button>
+                </div>
+            </div>
+        </div>
+            <div id="crMobileMenu">
+            <a href="../index.html">Home</a>
+            <a href="../dev_tools.html" class="nav-link font-medium">Developer Tools</a>
+            <a href="../ai_tools.html" class="nav-link font-medium">AI Tools</a>
+            <a href="../net_tools.html" class="nav-link font-medium">Network Tools</a>
+            <a href="../pricing.html">Pricing</a>
+        <div class="cr-mobile-group-label">Discover</div>
+        <a href="../blog.html" class="nav-link font-medium">Blog</a>
+        <a href="../news.html" class="nav-link font-medium">News</a>
+        <a href="../hardware.html" class="nav-link font-medium">Hardware</a>
+            </div>
+    </nav>
+
+    <section class="glow-header py-10 px-4 sm:px-6 lg:px-8 border-b border-gray-800">
+        <div class="max-w-6xl mx-auto">
+            <a href="../ai_tools.html" class="text-gray-400 hover:text-[#15A6DE] transition flex items-center gap-2 mb-6 text-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                Back to AI Tools
+            </a>
+            <div class="flex items-center gap-4">
+                <div class="icon-box">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                </div>
+                <div>
+                    <div class="flex items-center gap-3">
+                        <h1 class="glow-title text-3xl font-bold">Grammar & Clarity Checker</h1>
+                        <span class="badge-free">Free</span>
+                    </div>
+                    <p class="text-gray-400 mt-1">Catch grammar, spelling, and style issues as you write.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="py-10 px-4 sm:px-6 lg:px-8">
+        <div class="max-w-6xl mx-auto">
+            <div class="flex items-center justify-between mb-2">
+                <label class="text-sm text-gray-400" for="inputArea">Your text</label>
+                <button id="uploadToggleBtn" class="text-[#15A6DE] hover:text-[#7CC7F2] text-xs font-semibold flex items-center gap-1">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                    Upload a document instead
+                </button>
+            </div>
+            <div id="uploadZoneWrap" class="mb-4 hidden">
+                <div id="uploadZone" class="upload-zone">
+                    <input type="file" id="fileInput" accept=".txt,.md">
+                    <p class="text-sm text-gray-400">Drop a <strong>.txt</strong> or <strong>.md</strong> file here, or click to browse</p>
+                </div>
+                <div id="uploadedFile" class="upload-filename hidden">
+                    <span id="uploadedFileName" class="truncate"></span>
+                    <svg class="w-4 h-4 remove-file" id="removeFileBtn" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </div>
+            </div>
+
+            <textarea id="inputArea" class="code-area w-full rounded-lg p-4 mb-3" style="height: 220px;" placeholder="Type or paste your writing here..." spellcheck="false"></textarea>
+
+            <div class="flex items-center justify-between mb-4">
+                <p class="text-gray-500 text-xs">Checked via the public <a href="https://languagetool.org" target="_blank" rel="noopener" class="underline hover:text-[#15A6DE]">LanguageTool</a> API - usage is rate-limited; a self-hosted version is coming.</p>
+                <button id="checkBtn" class="cta-btn px-6 py-2 rounded-md text-sm font-semibold text-white flex items-center gap-2 whitespace-nowrap">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                    Check Grammar
+                </button>
+            </div>
+
+            <div id="errorBanner" class="error-banner mb-4 hidden"></div>
+            <div id="loadingState" class="text-gray-500 text-sm mb-4 hidden flex items-center gap-2">
+                <svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+                Checking your text...
+            </div>
+
+            <div id="resultsPanel" class="hidden">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-lg font-bold">Results</h3>
+                    <span id="issueCountBadge" class="success-badge"></span>
+                </div>
+                <div class="border border-gray-800 rounded-2xl bg-black/40 p-6 mb-6">
+                    <div id="highlightView" class="highlight-view text-gray-200 text-sm"></div>
+                </div>
+                <div id="issuesList"></div>
+            </div>
+
+            <div class="flex justify-between items-center mt-10 pt-6 border-t border-gray-800">
+                <a href="../ai_tools.html" class="tool-nav-link">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                    Back to AI Tools
+                </a>
+                <a href="feedback_tutor.html" class="tool-nav-link">
+                    Explain My Feedback Tutor
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                </a>
+            </div>
+        </div>
+    </section>
+
+    <script>
+        // Theme Toggle
+        const themeToggle = document.getElementById('theme-toggle');
+        if (themeToggle) {
+            themeToggle.addEventListener('change', function() {
+                document.body.classList.toggle('light-mode', this.checked);
+            });
+        }
+
+        // Upload zone
+        const uploadToggleBtn = document.getElementById('uploadToggleBtn');
+        const uploadZoneWrap = document.getElementById('uploadZoneWrap');
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const uploadedFile = document.getElementById('uploadedFile');
+        const uploadedFileName = document.getElementById('uploadedFileName');
+        const removeFileBtn = document.getElementById('removeFileBtn');
+        const inputArea = document.getElementById('inputArea');
+
+        uploadToggleBtn.addEventListener('click', () => uploadZoneWrap.classList.toggle('hidden'));
+        function handleFile(file) {
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                inputArea.value = e.target.result;
+                uploadedFileName.textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+                uploadZone.classList.add('hidden');
+                uploadedFile.classList.remove('hidden');
+            };
+            reader.readAsText(file);
+        }
+        uploadZone.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+        uploadZone.addEventListener('dragover', (e) => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+        uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+        uploadZone.addEventListener('drop', (e) => { e.preventDefault(); uploadZone.classList.remove('dragover'); handleFile(e.dataTransfer.files[0]); });
+        removeFileBtn.addEventListener('click', () => {
+            fileInput.value = '';
+            uploadZone.classList.remove('hidden');
+            uploadedFile.classList.add('hidden');
+        });
+
+        // ---- Grammar check ----
+        const errorBanner = document.getElementById('errorBanner');
+        const loadingState = document.getElementById('loadingState');
+        const resultsPanel = document.getElementById('resultsPanel');
+        const checkBtn = document.getElementById('checkBtn');
+
+        function categoryClass(categoryName) {
+            const c = (categoryName || '').toLowerCase();
+            if (c.includes('typo') || c.includes('spell')) return 'category-typo';
+            if (c.includes('style') || c.includes('confused')) return 'category-style';
+            return '';
+        }
+
+        function escapeHtml(s) {
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function renderHighlighted(text, matches) {
+            const sorted = [...matches].sort((a, b) => a.offset - b.offset);
+            let html = '';
+            let cursor = 0;
+            sorted.forEach((m, i) => {
+                if (m.offset < cursor) return; // skip overlapping matches
+                html += escapeHtml(text.slice(cursor, m.offset));
+                const span = text.slice(m.offset, m.offset + m.length);
+                html += `<span class="issue-mark ${categoryClass(m.rule.category.name)}" data-issue-idx="${i}" title="${escapeHtml(m.message)}">${escapeHtml(span)}</span>`;
+                cursor = m.offset + m.length;
+            });
+            html += escapeHtml(text.slice(cursor));
+            return html;
+        }
+
+        function renderIssuesList(matches) {
+            const issuesList = document.getElementById('issuesList');
+            if (!matches.length) {
+                issuesList.innerHTML = '';
+                return;
+            }
+            issuesList.innerHTML = matches.map((m) => `
+                <div class="issue-card">
+                    <div class="flex items-start justify-between gap-3 mb-1">
+                        <span class="text-sm font-semibold text-gray-200">${escapeHtml(m.shortMessage || m.rule.category.name)}</span>
+                        <span class="text-xs text-gray-500 flex-shrink-0">${escapeHtml(m.rule.category.name)}</span>
+                    </div>
+                    <p class="text-gray-400 text-sm mb-2">${escapeHtml(m.message)}</p>
+                    ${m.replacements.length ? `<div>${m.replacements.slice(0, 5).map(r => `<span class="issue-replacement">${escapeHtml(r.value)}</span>`).join('')}</div>` : ''}
+                </div>`).join('');
+        }
+
+        async function checkGrammar() {
+            errorBanner.classList.add('hidden');
+            resultsPanel.classList.add('hidden');
+            const text = inputArea.value.trim();
+            if (!text) {
+                errorBanner.textContent = 'Please enter some text to check.';
+                errorBanner.classList.remove('hidden');
+                return;
+            }
+            if (text.length > 15000) {
+                errorBanner.textContent = 'That text is quite long - try checking it in smaller chunks (under ~15,000 characters) for best results with the public API.';
+                errorBanner.classList.remove('hidden');
+                return;
+            }
+            checkBtn.disabled = true;
+            loadingState.classList.remove('hidden');
+            try {
+                const res = await fetch('https://api.languagetool.org/v2/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ text, language: 'en-US' }),
+                });
+                if (res.status === 429) {
+                    throw new Error('The public LanguageTool API is rate-limited and we\'ve hit the limit for now. Please try again in a minute.');
+                }
+                if (!res.ok) {
+                    throw new Error(`LanguageTool API returned an error (${res.status}).`);
+                }
+                const data = await res.json();
+                const matches = data.matches || [];
+
+                document.getElementById('highlightView').innerHTML = renderHighlighted(text, matches);
+                renderIssuesList(matches);
+                const badge = document.getElementById('issueCountBadge');
+                badge.textContent = matches.length === 0 ? 'No issues found' : `${matches.length} issue${matches.length === 1 ? '' : 's'} found`;
+                resultsPanel.classList.remove('hidden');
+            } catch (e) {
+                errorBanner.textContent = e.message || 'Something went wrong reaching the grammar checker. Please try again.';
+                errorBanner.classList.remove('hidden');
+            } finally {
+                checkBtn.disabled = false;
+                loadingState.classList.add('hidden');
+            }
+        }
+        checkBtn.addEventListener('click', checkGrammar);
+    </script>
+
+    <script>
+    /* === CoreRipper nav auth state (shared) === */
+    (function () {
+        var loginEl = document.getElementById('navLogin');
+        var ctaEl = document.getElementById('navCta');
+        if (!loginEl || !ctaEl) return;
+        var token = localStorage.getItem('coreripperToken');
+        if (!token) return;
+
+        function renderLoggedIn(user) {
+            loginEl.textContent = user.email.split('@')[0];
+            loginEl.title = user.email;
+            loginEl.href = user.is_admin ? '../admin.html' : '#';
+            if (!user.is_admin) loginEl.style.cursor = 'default';
+            var wbEl = document.getElementById('navWorkbench');
+            ctaEl.textContent = 'Log out';
+            ctaEl.onclick = function () {
+                window.CoreRipperAuth.logout();
+                window.location.reload();
+            };
+        }
+
+        // Validate the token server-side before trusting anything cached 
+        // a stale/invalid token (e.g. after a backend restart) must not show
+        // a logged-in nav. On 401, clear storage so the default logged-out
+        // markup already in the HTML stands. On success, refresh the cached
+        // user (subscription/trial status is never stale).
+        fetch(window.CR_API_BASE + '/api/accounts/me/', { headers: { 'Authorization': 'Bearer ' + token } })
+            .then(function (res) {
+                if (res.status === 401) {
+                    localStorage.removeItem('coreripperToken');
+                    localStorage.removeItem('coreripperUser');
+                    return null;
+                }
+                if (!res.ok) return undefined; // transient error  leave nav as-is, don't force a false logout
+                return res.json();
+            })
+            .then(function (user) {
+                if (!user) return;
+                localStorage.setItem('coreripperUser', JSON.stringify(user));
+                renderLoggedIn(user);
+            })
+            .catch(function () {});
+    })();
+    </script>
+
+    <footer class="cr-footer">
+        <div class="cr-footer-inner">
+            <div class="cr-footer-grid">
+                <div class="cr-footer-brand-col">
+                <div class="cr-footer-brand">
+                    <div class="cr-logo-tile" style="width: 36px; height: 36px;">
+                        <svg width="22" height="22" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <defs>
+                                <linearGradient id="coreGradient-footer" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                                <linearGradient id="pulseGradient-footer" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                                <filter id="neonGlow-footer" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+                            </defs>
+                            <path d="M 32 6 L 52 18 L 52 46 L 32 58 L 12 46 L 12 18 Z" stroke="url(#coreGradient-footer)" stroke-width="4" stroke-linejoin="round" opacity="0.45" />
+                            <path d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-footer)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-footer)" />
+                        </svg>
+                    </div>
+                    <span class="cr-footer-name">Core<span class="grad">Ripper</span></span>
+                </div>
+                <p class="cr-footer-blurb">80+ developer, AI, and network tools in one toolkit. Plus blog, news feed, and uptime monitoring.</p>
+                <div class="cr-footer-social">
+                        <a href="https://github.com/Lilblucher" aria-label="GitHub" target="_blank" rel="noopener"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.809 1.304 3.495.997.107-.775.42-1.304.763-1.604-2.665-.303-5.467-1.334-5.467-5.93 0-1.31.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23a11.51 11.51 0 013.003-.404c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222 0 1.606-.014 2.898-.014 3.293 0 .322.216.694.825.576C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg></a>
+                        <a href="https://www.linkedin.com/in/clive-moono-b5b72b403/" aria-label="LinkedIn" target="_blank" rel="noopener"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg></a>
+                        <a href="https://www.reddit.com/user/Great-Two8866/?screen_view_count=2&ext-referrer=SEO" aria-label="Reddit" target="_blank" rel="noopener"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M24 11.779c0-1.459-1.192-2.645-2.657-2.645-.715 0-1.362.286-1.84.746-1.81-1.191-4.259-1.949-6.971-2.046l1.483-4.669 4.016.941-.006.058c0 1.193.975 2.163 2.174 2.163 1.198 0 2.172-.97 2.172-2.163s-.975-2.164-2.172-2.164c-.92 0-1.704.574-2.021 1.379l-4.329-1.014c-.145-.033-.291.045-.339.186l-1.638 5.146c-2.75.075-5.235.833-7.066 2.038-.478-.464-1.128-.752-1.847-.752-1.465 0-2.657 1.187-2.657 2.646 0 .97.533 1.811 1.317 2.271-.052.282-.086.567-.086.857 0 3.911 4.808 7.093 10.719 7.093s10.72-3.182 10.72-7.093c0-.276-.029-.547-.075-.813.832-.447 1.404-1.312 1.404-2.315zm-17.224 1.816c0-.868.71-1.575 1.582-1.575.872 0 1.581.707 1.581 1.575s-.709 1.574-1.581 1.574c-.872.001-1.582-.706-1.582-1.574zm9.061 4.669c-.797.793-2.048 1.179-3.824 1.179l-.013-.003-.013.003c-1.777 0-3.028-.386-3.824-1.179-.145-.144-.145-.379 0-.523.145-.145.381-.145.526 0 .65.647 1.729.961 3.298.961l.013.003.013-.003c1.569 0 2.648-.315 3.298-.961.145-.145.381-.145.526 0 .145.144.145.379 0 .523zm-.189-3.095c-.872 0-1.581-.706-1.581-1.574 0-.868.709-1.575 1.581-1.575s1.581.707 1.581 1.575c.001.868-.708 1.574-1.581 1.574z"/></svg></a>
+                        <a href="mailto:support@coreripper.site" aria-label="Email"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg></a>
+                    </div>
+                </div>
+                <div class="cr-footer-col">
+                    <div class="head">Developer tools</div>
+                    <a href="../dev_tools.html">JSON formatter</a>
+                    <a href="../dev_tools.html">JWT decoder</a>
+                    <a href="../dev_tools.html">Password generator</a>
+                    <a href="../dev_tools.html">View all tools</a>
+                </div>
+                <div class="cr-footer-col">
+                    <div class="head">AI tools</div>
+                    <a href="../ai_tools.html">AI humanizer</a>
+                    <a href="../ai_tools.html">Grammar checker</a>
+                    <a href="../ai_tools.html">Code explainer</a>
+                    <a href="../ai_tools.html">View all tools</a>
+                </div>
+                <div class="cr-footer-col">
+                    <div class="head">Network tools</div>
+                    <a href="../net_tools.html">Security grade</a>
+                    <a href="../net_tools.html">Port scanner</a>
+                    <a href="../net_tools.html">DNS lookup</a>
+                    <a href="../net_tools.html">View all tools</a>
+                </div>
+                <div class="cr-footer-col">
+                    <div class="head">Company</div>
+                    <a href="../blog.html">Blog</a>
+                    <a href="../news.html">News</a>
+                    <a href="../hardware.html">Hardware</a>
+                    <a href="../pricing.html">Pricing</a>
+                    <a href="../about.html">About</a>
+                    <a href="../support.html">Support</a>
+                </div>
+            </div>
+            <div class="cr-footer-bottom">
+                <p>© 2026 CoreRipper. All rights reserved.</p>
+                <div class="cr-footer-links">
+                    <a href="../cookie-policy.html">Cookie policy</a>
+                    <a href="../privacy.html" id="privacyLink">Privacy</a>
+                    <a href="../terms.html" id="termsLink">Terms</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+    document.addEventListener('click', function (e) {
+        var w = document.getElementById('navContentWrap');
+        if (w && !w.contains(e.target)) {
+            var m = document.getElementById('navContentMenu');
+            var b = document.getElementById('navContentBtn');
+            if (m) m.classList.remove('open');
+            if (b) b.setAttribute('aria-expanded', 'false');
+        }
+    });
+    </script>
+<!-- CR_OS_MODE_START -->
+<script>
+(function () {
+    fetch(window.CR_API_BASE + '/api/features/')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+            if (!d || !d.features || d.features.monetization !== false) return;
+            // Hide Pricing nav link (desktop + mobile)
+            document.querySelectorAll('a[href="pricing.html"], a[href="../pricing.html"]').forEach(function (a) {
+                if (a.textContent.trim() === 'Pricing') a.style.display = 'none';
+            });
+            // Hide Billing nav dropdown item (nothing to bill while monetization is off)
+            document.querySelectorAll('a[href="billing.html"], a[href="../billing.html"]').forEach(function (a) {
+                if (a.textContent.trim() === 'Billing') a.style.display = 'none';
+            });
+            // Hide credit chip
+            var cc = document.getElementById('crCreditWrap');
+            if (cc) cc.style.display = 'none';
+            var creditCta = document.querySelector('.cr-credit-cta');
+            if (creditCta) creditCta.style.display = 'none';
+            // Hide "Sonnet-5 credits" label in dropdown
+            document.querySelectorAll('.cr-dd-email').forEach(function (el) {
+                if (el.textContent.trim() === 'Sonnet-5 credits') el.style.display = 'none';
+            });
+            // Dashboard: hide PREMIUM pill + credits pill
+            var pill = document.getElementById('wbPlanPill');
+            if (pill) pill.style.display = 'none';
+            var cpill = document.getElementById('creditsPill');
+            if (cpill) cpill.style.display = 'none';
+        })
+        .catch(function () {});
+})();
+</script>
+<!-- CR_OS_MODE_END -->
+</body>
+</html>

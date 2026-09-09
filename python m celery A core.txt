@@ -1,0 +1,4 @@
+python -m celery -A core_backend worker -l info --concurrency=2
+/python manage.py migrate django_celery_beat
+python -m celery -A core_backend beat -l info
+

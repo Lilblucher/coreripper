@@ -1,0 +1,3216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    
+    <script>
+    window.CR_API_BASE = (function () {
+        var loc = window.location;
+        // Opened straight off disk (file://) -- no origin to inherit.
+        if (!loc.hostname) return 'http://127.0.0.1:8000';
+        // Local dev: the static pages are served on their own port
+        // (_nocache_server.py on 5501, Live Server on 5500) while Django runs
+        // on 8000. Derived from the current host so it also works when Django
+        // itself serves the page on :8000.
+        if (loc.hostname === 'localhost' || loc.hostname === '127.0.0.1' || loc.hostname === '[::1]') {
+            return loc.protocol + '//' + loc.hostname + ':8000';
+        }
+        // Production: the API is served from the same origin as the site.
+        return loc.origin;
+    })();
+    </script>
+
+    <script>
+    (function () {
+        var IDLE_LIMIT_MS = 30 * 60 * 1000;  // hard idle cutoff
+        var IDLE_WARN_MS  = 2 * 60 * 1000;   // warn this long before the cutoff
+        var TICK_MS       = 5000;            // heartbeat + idle check cadence
+        // Background tabs get their timers throttled to roughly one tick a
+        // minute, so the heartbeat must be allowed to go well over a minute
+        // stale before we call it a closed browser.
+        var TAB_GRACE_MS  = 90 * 1000;
+        var LOGIN_URL     = 'login.html';
+
+        var K_TOKEN   = 'coreripperToken',
+            K_USER    = 'coreripperUser',
+            K_REFRESH = 'coreripperRefreshToken',
+            K_EXPIRY  = 'coreripperTokenExpiresAt',
+            K_ACTIVE  = 'coreripperLastActivity',
+            K_BEAT    = 'coreripperHeartbeat',
+            K_ENDED   = 'coreripperSessionEnded',
+            K_TAB     = 'coreripperTabAlive';
+
+        function get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+        function set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+        function del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+        function now() { return Date.now(); }
+
+        function clearSession() {
+            del(K_TOKEN); del(K_USER); del(K_REFRESH); del(K_EXPIRY);
+            del(K_ACTIVE); del(K_BEAT);
+        }
+        function stamp() { set(K_ACTIVE, String(now())); set(K_BEAT, String(now())); }
+        function storeSession(data) {
+            if (data.token) set(K_TOKEN, data.token);
+            if (data.token_expires_at) set(K_EXPIRY, data.token_expires_at);
+            if (data.refresh_token) set(K_REFRESH, data.refresh_token);
+            del(K_ENDED);
+            stamp();
+        }
+        function revoke() {
+            var token = get(K_TOKEN), refresh = get(K_REFRESH);
+            clearSession();
+            try {
+                var headers = { 'Content-Type': 'application/json' };
+                if (token) headers['Authorization'] = 'Bearer ' + token;
+                fetch(window.CR_API_BASE + '/api/accounts/logout/', {
+                    method: 'POST',
+                    keepalive: true,
+                    headers: headers,
+                    body: JSON.stringify({ refresh_token: refresh || '' })
+                }).catch(function () {});
+            } catch (e) { /* revocation is best-effort; local state is already cleared */ }
+        }
+        function endSession(reason) {
+            set(K_ENDED, reason);   // tells the other open tabs why they're being bounced
+            revoke();
+            hideWarning();
+            window.location.href = LOGIN_URL + '?reason=' + reason;
+        }
+        window.CoreRipperAuth = { store: storeSession, logout: revoke, touch: stamp };
+
+        // --- did the whole browser close since this session was last used? ---
+        var freshTab = false;
+        try {
+            freshTab = !sessionStorage.getItem(K_TAB);
+            sessionStorage.setItem(K_TAB, '1');
+        } catch (e) { /* storage blocked: treat as a continuing tab, never log out blindly */ }
+        var sawToken = !!get(K_TOKEN);
+        if (freshTab && sawToken && !get(K_REFRESH)) {
+            var beatAt = parseInt(get(K_BEAT) || '0', 10);
+            if (!beatAt || now() - beatAt > TAB_GRACE_MS) {
+                // No Remember-Me and no other live tab: the browser was closed.
+                revoke();
+                sawToken = false;
+            }
+        }
+        // A page load is real activity -- this is also what stops a remembered
+        // session from idling out on the time the browser spent closed.
+        if (get(K_TOKEN)) stamp();
+
+        // --- idle warning modal ---
+        var warnEl = null, warnCount = null, warned = false, countTimer = null;
+        function buildWarning() {
+            if (!document.body) return null;
+            var el = document.createElement('div');
+            el.id = 'crIdleModal';
+            el.setAttribute('role', 'dialog');
+            el.setAttribute('aria-modal', 'true');
+            el.setAttribute('aria-labelledby', 'crIdleTitle');
+            el.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;' +
+                'justify-content:center;padding:16px;background:rgba(3,7,18,.78);' +
+                'font-family:Space Grotesk,Inter,system-ui,-apple-system,sans-serif;';
+            el.innerHTML =
+                '<div style="max-width:400px;width:100%;background:#0f1115;border:1px solid rgba(37,151,232,.35);' +
+                'border-radius:14px;padding:26px 24px;box-shadow:0 24px 60px rgba(0,0,0,.6);color:#e5e7eb;text-align:center;">' +
+                  '<svg viewBox="0 0 24 24" fill="none" stroke="#2597e8" stroke-width="1.6" stroke-linecap="round" ' +
+                  'stroke-linejoin="round" style="width:38px;height:38px;margin:0 auto 12px;display:block;">' +
+                    '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>' +
+                  '<h2 id="crIdleTitle" style="margin:0 0 8px;font-size:19px;font-weight:700;color:#fff;">Are you still there?</h2>' +
+                  '<p style="margin:0;font-size:14px;line-height:1.55;color:#9ca3af;">' +
+                    "You've been inactive for a while. For your security we'll sign you out in " +
+                    '<span id="crIdleCount" style="color:#2597e8;font-weight:700;font-variant-numeric:tabular-nums;">2:00</span>.</p>' +
+                  '<div style="display:flex;gap:10px;margin-top:20px;">' +
+                    '<button type="button" id="crIdleStay" style="flex:1;padding:11px 12px;border:0;border-radius:9px;' +
+                    'background:#2597e8;color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;">Stay signed in</button>' +
+                    '<button type="button" id="crIdleOut" style="flex:1;padding:11px 12px;border:1px solid #2a2f3a;' +
+                    'border-radius:9px;background:transparent;color:#9ca3af;font-size:14px;font-weight:600;cursor:pointer;' +
+                    'font-family:inherit;">Log out now</button>' +
+                  '</div>' +
+                '</div>';
+            document.body.appendChild(el);
+            warnCount = el.querySelector('#crIdleCount');
+            el.querySelector('#crIdleStay').addEventListener('click', function () {
+                warned = false;
+                lastWrite = now();
+                stamp();
+                hideWarning();
+            });
+            el.querySelector('#crIdleOut').addEventListener('click', function () {
+                endSession('signed_out');
+            });
+            return el;
+        }
+        function paintCountdown() {
+            if (!warnCount) return;
+            var left = Math.max(0, IDLE_LIMIT_MS - (now() - (parseInt(get(K_ACTIVE) || '0', 10))));
+            warnCount.textContent = Math.floor(left / 60000) + ':' +
+                ('0' + Math.floor((left % 60000) / 1000)).slice(-2);
+            if (left <= 0) endSession('timeout');
+        }
+        function showWarning() {
+            if (!warnEl) warnEl = buildWarning();
+            if (!warnEl) return;
+            warned = true;
+            warnEl.style.display = 'flex';
+            paintCountdown();
+            if (!countTimer) countTimer = setInterval(paintCountdown, 1000);
+            var stay = warnEl.querySelector('#crIdleStay');
+            if (stay) stay.focus();
+        }
+        function hideWarning() {
+            warned = false;
+            if (countTimer) { clearInterval(countTimer); countTimer = null; }
+            if (warnEl) warnEl.style.display = 'none';
+        }
+
+        // --- activity tracking (shared across tabs via localStorage) ---
+        var lastWrite = 0;
+        function onActivity() {
+            if (warned) return;   // the warning has to be dismissed deliberately
+            if (!get(K_TOKEN)) return;
+            var t = now();
+            if (t - lastWrite < 10000) return;   // one storage write per 10s at most
+            lastWrite = t;
+            stamp();
+        }
+        var events = ['mousedown', 'mousemove', 'keydown', 'input', 'wheel', 'touchstart', 'scroll', 'click'];
+        for (var i = 0; i < events.length; i++) {
+            window.addEventListener(events[i], onActivity, { passive: true, capture: true });
+        }
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) onActivity();
+        });
+
+        setInterval(function () {
+            var token = get(K_TOKEN);
+            if (token) sawToken = true;
+            if (!token) {
+                hideWarning();
+                // Another tab ended the shared session -- follow it out.
+                if (sawToken && get(K_ENDED)) {
+                    window.location.href = LOGIN_URL + '?reason=' + get(K_ENDED);
+                }
+                return;
+            }
+            set(K_BEAT, String(now()));   // liveness only; NOT activity
+            var last = parseInt(get(K_ACTIVE) || '0', 10);
+            if (!last) { stamp(); return; }
+            var idle = now() - last;
+            if (idle >= IDLE_LIMIT_MS) { endSession('timeout'); return; }
+            if (idle >= IDLE_LIMIT_MS - IDLE_WARN_MS) showWarning();
+            else if (warned) hideWarning();   // activity in another tab reset the clock
+        }, TICK_MS);
+
+        // --- token renewal off the Remember-Me refresh token ---
+        var refresh = get(K_REFRESH);
+        if (!refresh) return;
+        var expiryRaw = get(K_EXPIRY);
+        var expiry = expiryRaw ? Date.parse(expiryRaw) : 0;
+        var expired = !get(K_TOKEN) || !expiry || expiry <= now();
+        // Renew inside the last 90 minutes so an open session never actually
+        // lapses mid-use; a fully expired one is restored and the page rebooted.
+        if (!expired && expiry - now() > 90 * 60 * 1000) return;
+        fetch(window.CR_API_BASE + '/api/accounts/refresh/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh_token: refresh })
+        }).then(function (res) {
+            if (res.status === 400 || res.status === 401) {
+                // Dead refresh token. Only clear if another tab hasn't already
+                // rotated it (two tabs can race the same single-use token).
+                if (get(K_REFRESH) === refresh) {
+                    del(K_REFRESH);
+                    if (expired) clearSession();
+                }
+                return null;
+            }
+            return res.ok ? res.json() : null;
+        }).then(function (data) {
+            if (!data || !data.token) return;
+            storeSession(data);
+            if (expired) window.location.reload();
+        }).catch(function () {});
+    })();
+    </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - CoreRipper</title>
+    <link rel="icon" href="assets/logo/favicon.svg" type="image/svg+xml">
+    <link rel="icon" href="assets/logo/favicon-32.png" sizes="32x32" type="image/png">
+    <link rel="icon" href="assets/logo/favicon-16.png" sizes="16x16" type="image/png">
+    <link rel="apple-touch-icon" href="assets/logo/apple-touch-icon-180.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { font-family: 'Space Grotesk', 'Inter', sans-serif; scroll-behavior: smooth; }
+        body { background-color: #0a0a0a; color: #e5e7eb; }
+        .gradient-text {
+            background: #2597e8;
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        }
+        .icon-box { width: 48px; height: 48px; border-radius: 12px; background: #141414;
+            border: 1.5px solid #2597E855; display: flex; align-items: center; justify-content: center; color: #2597E8; }
+        .icon-box.w-10 { width: 40px; height: 40px; }
+        .cta-btn { background: #2597e8; transition: all 0.3s ease; }
+        .cta-btn:hover:not(:disabled) { box-shadow: 0 4px 0 rgba(0,0,0,0.45); transform: translateY(-2px) scale(1.03); }
+        .cta-btn:disabled { cursor: not-allowed; opacity: 0.6; }
+
+        .tab-btn {
+            padding: 0.5rem 1rem; border: 1px solid rgba(37,151,232, 0.3); border-radius: 0.5rem;
+            font-size: 0.875rem; font-weight: 500; transition: all 0.2s ease; cursor: pointer; color: #9ca3af; background: transparent;
+        }
+        .news-filter-btn {
+            padding: 0.4rem 0.9rem; border: 1px solid rgba(37,151,232, 0.3); border-radius: 0.5rem;
+            font-size: 0.8rem; font-weight: 500; transition: all 0.2s ease; cursor: pointer; color: #9ca3af; background: transparent;
+        }
+        .news-filter-btn.active { background: #2597e8; border-color: #2597E8; color: white; }
+        .news-filter-btn:hover:not(.active) { border-color: rgba(37,151,232, 0.6); color: #2597E8; }
+        .news-item { border: 1px solid #1f2937; border-radius: 0.75rem; padding: 1rem 1.25rem; }
+        .news-item .title { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.25rem; }
+        .news-item .meta { font-size: 0.76rem; color: #6b7280; margin-bottom: 0.5rem; }
+        .news-item .summary { font-size: 0.85rem; color: #9ca3af; margin-bottom: 0.75rem; }
+        body.light-mode .news-item { border-color: #e5e7eb; }
+        /* Hardware moderation uses its own filter-button class so the News tab's
+           global active-state reset can't clobber this tab's filter (both tabs
+           reuse the .news-item card styling, which is visual-only and safe). */
+        .hw-filter-btn {
+            padding: 0.4rem 0.9rem; border: 1px solid rgba(37,151,232, 0.3); border-radius: 0.5rem;
+            font-size: 0.8rem; font-weight: 500; transition: all 0.2s ease; cursor: pointer; color: #9ca3af; background: transparent;
+        }
+        .hw-filter-btn.active { background: #2597e8; border-color: #2597E8; color: white; }
+        .hw-filter-btn:hover:not(.active) { border-color: rgba(37,151,232, 0.6); color: #2597E8; }
+        .tab-btn.active { background: #2597e8; border-color: #2597E8; color: white; }
+        .tab-btn:hover:not(.active) { border-color: rgba(37,151,232, 0.6); color: #2597E8; }
+        .tab-panel.hidden { display: none; }
+
+        .secondary-btn { background: #1a1a1a; border: 1px solid #374151; color: #d1d5db; transition: all 200ms ease; cursor: pointer; }
+        .secondary-btn:hover { border-color: #2597E8; color: #fff; }
+        .danger-btn { background: #1a1a1a; border: 1px solid rgba(248,113,113,0.4); color: #f87171; transition: all 200ms ease; cursor: pointer; }
+        .danger-btn:hover { border-color: #f87171; background: rgba(248,113,113,0.08); }
+
+        .field-input, .field-select, .code-area {
+            background: #0d0d0d; border: 1px solid #374151; border-radius: 0.5rem;
+            padding: 0.6rem 0.85rem; color: #e5e7eb; font-size: 0.9rem; width: 100%;
+        }
+        .field-input:focus, .field-select:focus, .code-area:focus { outline: none; border-color: #2597E8; box-shadow: 0 0 0 3px rgba(37,151,232,0.15); }
+        .code-area { font-family: 'Courier New', monospace; font-size: 0.85rem; }
+        .field-label { font-size: 0.8rem; font-weight: 600; color: #9ca3af; margin-bottom: 0.4rem; display: block; }
+
+        .error-banner {
+            border: 1px solid rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.08);
+            color: #f87171; border-radius: 0.75rem; padding: 1rem 1.25rem; font-size: 0.9rem;
+        }
+
+        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        th { text-align: left; color: #9ca3af; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; padding: 0.6rem 0.75rem; border-bottom: 1px solid #262626; }
+        td { padding: 0.75rem; border-bottom: 1px solid #1a1a1a; vertical-align: middle; }
+        tr:hover td { background: rgba(37,151,232,0.03); }
+
+        .badge { padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.72rem; font-weight: 600; display: inline-block; }
+        .badge.plan-premium { background: rgba(37,151,232,0.15); color: #2597E8; border: 1px solid rgba(37,151,232,0.3); }
+        .badge.plan-free { background: rgba(156,163,175,0.12); color: #9ca3af; border: 1px solid rgba(156,163,175,0.3); }
+        .badge.status-paid { background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
+        .badge.status-pending { background: rgba(251,191,36,0.12); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+        .badge.status-failed { background: rgba(248,113,113,0.12); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+        .badge.status-operational { background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
+        .badge.status-degraded { background: rgba(251,191,36,0.12); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+        .badge.status-down { background: rgba(248,113,113,0.12); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+        .badge.status-published { background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
+        .badge.status-draft { background: rgba(156,163,175,0.12); color: #9ca3af; border: 1px solid rgba(156,163,175,0.3); }
+
+        .status-select { font-size: 0.78rem; padding: 0.3rem 0.5rem; width: auto; }
+        .tool-notes-input { font-size: 0.78rem; padding: 0.3rem 0.5rem; }
+
+        .post-row { border: 1px solid #262626; border-radius: 0.75rem; transition: border-color 200ms ease; }
+        .post-row:hover { border-color: #374151; }
+
+        .editor-toolbar {
+            display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+            background: #0d0d0d; border: 1px solid #374151; border-bottom: none;
+            border-radius: 0.5rem 0.5rem 0 0; padding: 6px 8px;
+        }
+        .editor-toolbar button {
+            background: none; border: 1px solid transparent; border-radius: 6px;
+            color: #9ca3af; font-size: 0.78rem; font-weight: 600; padding: 4px 8px;
+            cursor: pointer; transition: all 0.15s ease; font-family: inherit;
+        }
+        .editor-toolbar button:hover { color: #f3f4f6; background: #1a1a1a; border-color: #374151; }
+        .editor-toolbar-sep { width: 1px; height: 18px; background: #262626; margin: 0 4px; }
+        .editor-toolbar + .code-area { border-top-left-radius: 0; border-top-right-radius: 0; }
+        .prose { color: #d1d5db; font-size: 0.95rem; line-height: 1.7; }
+        .prose img { max-width: 100%; border-radius: 0.75rem; border: 1px solid #262626; margin: 1.25rem 0; display: block; }
+        .prose mark { background: rgba(251,191,36,0.3); color: #fef3c7; border-radius: 3px; padding: 0 3px; }
+        .prose kbd { background: #1f2937; border: 1px solid #4b5563; border-bottom-width: 2px; border-radius: 4px; padding: 0.1rem 0.4rem; font-family: 'Courier New', monospace; font-size: 0.82em; }
+        .prose h2 { color: #f3f4f6; font-size: 1.3rem; font-weight: 700; margin: 1.5rem 0 0.75rem; }
+        .prose h3 { color: #f3f4f6; font-size: 1.1rem; font-weight: 700; margin: 1.25rem 0 0.5rem; }
+        .prose code { background: #1a1a1a; border: 1px solid #262626; border-radius: 4px; padding: 0.15rem 0.4rem; font-family: 'Courier New', monospace; font-size: 0.85em; }
+        .prose pre { background: #050505; border: 1px solid #1f2937; border-radius: 0.75rem; padding: 1rem; overflow-x: auto; margin: 1rem 0; }
+        .prose pre code { background: none; border: none; padding: 0; }
+
+        .success-toast {
+            position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(12px);
+            display: inline-flex; align-items: center; gap: 0.5rem;
+            background: #16a34a; color: #fff; padding: 0.6rem 1.1rem; border-radius: 999px;
+            font-size: 0.85rem; font-weight: 600; box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+            opacity: 0; transition: opacity 220ms ease-out, transform 220ms ease-out;
+            z-index: 100; pointer-events: none;
+        }
+        .success-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+        a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+            outline: 2px solid #2597E8; outline-offset: 2px; border-radius: 4px;
+        }
+
+        body.light-mode { background-color: #f3f4f6; color: #1f2937; }
+        body.light-mode nav { background-color: rgba(255, 255, 255, 0.8); border-color: #e5e7eb; }
+        body.light-mode .border-gray-800 { border-color: #e5e7eb; }
+        body.light-mode .text-gray-400 { color: #4b5563; }
+        body.light-mode .text-gray-500 { color: #6b7280; }
+        body.light-mode h1, body.light-mode h2 { color: #111827; }
+        body.light-mode .field-input, body.light-mode .field-select, body.light-mode .code-area { background: #ffffff; border-color: #d1d5db; color: #111827; }
+        body.light-mode .secondary-btn { background: #ffffff; border-color: #d1d5db; color: #374151; }
+        body.light-mode .post-row { border-color: #e5e7eb; }
+        body.light-mode th { color: #6b7280; }
+        body.light-mode td { border-color: #e5e7eb; }
+        body.light-mode .prose { color: #374151; }
+        body.light-mode .prose h2, body.light-mode .prose h3 { color: #111827; }
+    
+        /* === CoreRipper Logo Animation (shared) === */
+        .cr-logo { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; }
+        .cr-logo-tile {
+            width: 40px; height: 40px; border-radius: 12px;
+            background: linear-gradient(180deg, #17171c 0%, #0f0f13 100%) padding-box,
+                        linear-gradient(135deg, #2597E8 0%, #15A6DE 100%) border-box;
+            border: 1.5px solid transparent;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .cr-icon-wrap { display: flex; align-items: center; justify-content: center; animation: cr-breathe 2.6s ease-in-out 1.6s infinite; }
+        .cr-wordmark { display: inline-flex; align-items: baseline; font-size: 22px; font-weight: 800; letter-spacing: -0.02em; color: #e5e7eb; }
+        .cr-word-core { display: inline-block; color: #e5e7eb; animation: cr-core-in .45s ease-out .08s both; }
+        .cr-word-ripper-wrap { position: relative; display: inline-block; }
+        .cr-word-ripper-wrap .cr-half { display: inline-block; background: #2597e8; -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .cr-word-ripper-wrap .cr-half.top { clip-path: polygon(0% 0%, 100% 0%, 100% 34%, 62% 46%, 30% 54%, 0% 64%); animation: cr-rip-top .5s cubic-bezier(.2,.9,.3,1) .84s both; }
+        .cr-word-ripper-wrap .cr-half.bottom { position: absolute; left: 0; top: 0; clip-path: polygon(0% 64%, 30% 54%, 62% 46%, 100% 34%, 100% 100%, 0% 100%); animation: cr-rip-bottom .5s cubic-bezier(.2,.9,.3,1) .84s both; }
+        .cr-rip-streak { position: absolute; left: -6%; top: 47%; width: 0; height: 3px; border-radius: 2px; background: #15a6de; box-shadow: 0 4px 0 rgba(0,0,0,0.45); transform: rotate(-6deg); transform-origin: left center; animation: cr-rip-streak .45s ease-out .76s both; }
+
+        .cr-hex { stroke-dasharray: 1; stroke-dashoffset: 1; opacity: .5; animation: cr-draw-hex .55s cubic-bezier(.4,0,.2,1) 0s both, cr-hex-out .18s .68s forwards; }
+        .cr-frame { opacity: 0; animation: cr-frame-in .25s .68s both; }
+        .cr-frame.b { animation-delay: .74s; }
+        .cr-shard-a { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cr-shard-a .5s .68s both; }
+        .cr-shard-b { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cr-shard-b .5s .68s both; }
+        .cr-pulse { stroke-dasharray: 1; stroke-dashoffset: 1; animation: cr-draw-pulse .7s cubic-bezier(.16,1,.3,1) .72s both; }
+
+        @keyframes cr-draw-hex { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+        @keyframes cr-hex-out { to { opacity: 0; } }
+        @keyframes cr-frame-in { from { opacity: 0; } to { opacity: .45; } }
+        @keyframes cr-shard-a { 0% { opacity: 0; transform: none; } 20% { opacity: .55; } 100% { opacity: 0; transform: translate(4px, -5px) rotate(10deg); } }
+        @keyframes cr-shard-b { 0% { opacity: 0; transform: none; } 20% { opacity: .55; } 100% { opacity: 0; transform: translate(-4px, 5px) rotate(10deg); } }
+        @keyframes cr-draw-pulse { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+        @keyframes cr-core-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+        @keyframes cr-rip-top { 0% { opacity: 0; transform: translate(10px, -9px) rotate(2deg); } 60% { opacity: 1; transform: translate(-1px, 1px) rotate(-0.5deg); } 100% { opacity: 1; transform: none; } }
+        @keyframes cr-rip-bottom { 0% { opacity: 0; transform: translate(-10px, 9px) rotate(-2deg); } 60% { opacity: 1; transform: translate(1px, -1px) rotate(0.5deg); } 100% { opacity: 1; transform: none; } }
+        @keyframes cr-rip-streak { 0% { width: 0%; opacity: 0; } 15% { opacity: 1; } 80% { opacity: 1; } 100% { width: 116%; opacity: 0; } }
+        @keyframes cr-breathe {
+            0%, 100% { filter: drop-shadow(0 0 5px rgba(21,166,222,.45)) drop-shadow(0 0 2px rgba(37,151,232,.3)); }
+            50% { filter: drop-shadow(0 0 15px rgba(37,151,232,.85)) drop-shadow(0 0 5px rgba(21,166,222,.55)); }
+        }
+
+        .cr-splash {
+            position: fixed; inset: 0; z-index: 9999; background: #0a0a0a;
+            display: flex; align-items: center; justify-content: center; overflow: hidden;
+            opacity: 1; transition: opacity 0.4s ease-out;
+        }
+        .cr-splash.cr-splash-hide { opacity: 0; pointer-events: none; }
+        .cr-splash-glow {
+            position: absolute; inset: 0; pointer-events: none; opacity: 0;
+            background: none;
+            animation: cr-bg-glow-in 1s ease-out 2.1s forwards, cr-bg-glow-breathe 4s ease-in-out 3.1s infinite;
+        }
+        .cr-splash .cr-lockup { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+        .cr-splash .cr-icon-wrap {
+            position: relative;
+            animation: cr-load-glow 1.6s ease-in-out 1.42s forwards, cr-dim-idle 4s ease-in-out 3.02s infinite;
+        }
+        .cr-splash .cr-wordmark { font-size: 28px; }
+        @keyframes cr-load-glow {
+            0%   { filter: drop-shadow(0 0 6px rgba(21,166,222,.5)) drop-shadow(0 0 2px rgba(37,151,232,.3)); }
+            35%  { filter: drop-shadow(0 0 26px rgba(37,151,232,1)) drop-shadow(0 0 10px rgba(21,166,222,.9)); }
+            55%  { filter: drop-shadow(0 0 26px rgba(37,151,232,1)) drop-shadow(0 0 10px rgba(21,166,222,.9)); }
+            100% { filter: drop-shadow(0 0 3px rgba(21,166,222,.2)) drop-shadow(0 0 0px rgba(37,151,232,0)); }
+        }
+        @keyframes cr-dim-idle {
+            0%, 100% { filter: drop-shadow(0 0 3px rgba(21,166,222,.2)) drop-shadow(0 0 0px rgba(37,151,232,0)); }
+            50% { filter: drop-shadow(0 0 8px rgba(37,151,232,.45)) drop-shadow(0 0 2px rgba(21,166,222,.25)); }
+        }
+        @keyframes cr-bg-glow-in { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes cr-bg-glow-breathe {
+            0%, 100% { opacity: .7; transform: scale(1); }
+            50% { opacity: 1; transform: scale(1.06); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .cr-icon-wrap, .cr-hex, .cr-frame, .cr-shard-a, .cr-shard-b, .cr-pulse,
+            .cr-word-core, .cr-half.top, .cr-half.bottom, .cr-rip-streak {
+                animation: none !important;
+                opacity: 1 !important;
+            }
+            .cr-hex { display: none; }
+            .cr-frame { opacity: .45 !important; }
+            .cr-shard-a, .cr-shard-b { display: none; }
+            .cr-half.top, .cr-half.bottom { clip-path: none !important; }
+            .cr-rip-streak { display: none; }
+        }
+
+        body.light-mode .cr-word-core, body.light-mode .cr-wordmark { color: #0a0a0a; }
+
+        /* === Engine Room / Cockpit === */
+        .cockpit-role-badge {
+            font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+            padding: 0.25rem 0.65rem; border-radius: 999px; display: inline-flex; align-items: center; gap: 0.4rem;
+        }
+        .cockpit-role-badge.superuser { background: rgba(37,151,232,0.15); color: #2597E8; border: 1px solid rgba(37,151,232,0.35); }
+        .cockpit-role-badge.staff { background: rgba(168,85,247,0.15); color: #c084fc; border: 1px solid rgba(168,85,247,0.35); }
+
+        .panel {
+            background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0) 100%);
+            border: 1px solid #1f2937; border-radius: 1rem; padding: 1.25rem 1.5rem;
+            position: relative; overflow: hidden;
+        }
+        .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+        .panel-title { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7280; display: flex; align-items: center; gap: 0.5rem; }
+
+        .led { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; position: relative; }
+        .led.on { background: #10b981; box-shadow: 0 0 6px 1px rgba(16,185,129,0.8); animation: led-pulse 2.4s ease-in-out infinite; }
+        .led.off { background: #f87171; box-shadow: 0 0 6px 1px rgba(248,113,113,0.8); }
+        .led.warn { background: #fbbf24; box-shadow: 0 0 6px 1px rgba(251,191,36,0.8); animation: led-pulse 1.2s ease-in-out infinite; }
+        @keyframes led-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+        .systems-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; }
+        .system-cell {
+            background: #0d0d0d; border: 1px solid #1f2937; border-radius: 0.65rem; padding: 0.85rem 1rem;
+            display: flex; align-items: center; justify-content: space-between; transition: border-color 0.2s;
+        }
+        .system-cell:hover { border-color: #374151; }
+        .system-cell .label { font-size: 0.82rem; color: #d1d5db; font-weight: 500; }
+        .system-cell .value { font-size: 0.68rem; color: #6b7280; font-family: 'Courier New', monospace; margin-top: 2px; }
+
+        .uptime-readout {
+            font-family: 'Courier New', monospace; font-size: 1.5rem; font-weight: 700; color: #2597E8;
+            letter-spacing: 0.02em; text-shadow: 0 0 12px rgba(37,151,232,0.5);
+        }
+
+        .activity-feed { max-height: 420px; overflow-y: auto; }
+        .activity-row {
+            display: flex; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid #161616;
+            font-size: 0.82rem; align-items: baseline; animation: activity-in 0.4s ease-out both;
+        }
+        @keyframes activity-in { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+        .activity-row:last-child { border-bottom: none; }
+        .activity-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 6px; }
+        .activity-dot.signup { background: #2597E8; }
+        .activity-dot.payment { background: #10b981; }
+        .activity-dot.alert { background: #f87171; }
+        .activity-dot.ticket { background: #fbbf24; }
+        .activity-dot.blog { background: #c084fc; }
+        .activity-ts { color: #4b5563; font-family: 'Courier New', monospace; font-size: 0.72rem; white-space: nowrap; flex-shrink: 0; }
+        .activity-text { color: #d1d5db; }
+
+        /* Toggle switch  cockpit-style physical switch */
+        .cockpit-switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+        .cockpit-switch input { opacity: 0; width: 0; height: 0; }
+        .cockpit-switch .track {
+            position: absolute; cursor: pointer; inset: 0; background: #1f2937; border: 1px solid #374151;
+            border-radius: 999px; transition: background 0.25s, border-color 0.25s;
+        }
+        .cockpit-switch .track::before {
+            content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 2.5px;
+            background: #6b7280; border-radius: 50%; transition: transform 0.25s, background 0.25s;
+        }
+        .cockpit-switch input:checked + .track { background: rgba(16,185,129,0.18); border-color: #10b981; }
+        .cockpit-switch input:checked + .track::before { transform: translateX(20px); background: #10b981; box-shadow: 0 0 6px rgba(16,185,129,0.7); }
+        .cockpit-switch input:disabled + .track { opacity: 0.5; cursor: not-allowed; }
+
+        .feature-row {
+            display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+            padding: 0.9rem 1rem; background: #0d0d0d; border: 1px solid #1f2937; border-radius: 0.65rem;
+        }
+        .feature-row .name { font-size: 0.9rem; font-weight: 600; color: #f3f4f6; }
+        .feature-row .desc { font-size: 0.76rem; color: #6b7280; margin-top: 2px; }
+        .feature-row.disabled { border-color: rgba(248,113,113,0.3); background: rgba(248,113,113,0.04); }
+
+        .role-select { font-size: 0.78rem; padding: 0.3rem 0.5rem; width: auto; }
+
+        /* Danger zone  the red confirm + countdown */
+        .danger-overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.75); backdrop-filter: blur(3px);
+            display: flex; align-items: center; justify-content: center; z-index: 200; padding: 1rem;
+        }
+        .danger-modal {
+            width: 100%; max-width: 440px; background: #140505; border: 2px solid #ef4444; border-radius: 1rem;
+            padding: 1.75rem; box-shadow: 0 0 0 6px rgba(239,68,68,0.12), 0 20px 60px rgba(0,0,0,0.6);
+            animation: danger-shake-in 0.35s cubic-bezier(.36,.07,.19,.97) both;
+        }
+        @keyframes danger-shake-in {
+            0% { transform: scale(0.9); opacity: 0; }
+            60% { transform: scale(1.02); opacity: 1; }
+            100% { transform: scale(1); }
+        }
+        .danger-modal h2 {
+            color: #f87171; font-size: 1.15rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.03em;
+            display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;
+        }
+        .danger-modal .stripe {
+            height: 6px; border-radius: 4px; margin-bottom: 1rem;
+            background: repeating-linear-gradient(45deg, #ef4444, #ef4444 10px, #7f1d1d 10px, #7f1d1d 20px);
+        }
+        .danger-confirm-btn {
+            width: 100%; padding: 0.85rem; border-radius: 0.6rem; font-weight: 700; font-size: 0.95rem;
+            background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; cursor: not-allowed;
+            transition: all 0.2s ease; font-family: 'Courier New', monospace;
+        }
+        .danger-confirm-btn.armed { background: #ef4444; color: #fff; cursor: pointer; box-shadow: 0 0 20px rgba(239,68,68,0.5); }
+        .danger-confirm-btn.armed:hover { background: #dc2626; }
+
+        /* Article image preview (news/hardware admin cards) + the shared
+           "Change picture" picker modal reused by both tabs and the blog editor. */
+        .article-thumb-row { display: flex; gap: 0.75rem; align-items: flex-start; margin: 0.5rem 0; }
+        .article-thumb { width: 96px; height: 64px; object-fit: cover; border-radius: 0.5rem; border: 1px solid #1f2937; flex-shrink: 0; background: #111; }
+        .article-thumb-meta { font-size: 0.72rem; color: #6b7280; line-height: 1.4; }
+        .article-thumb-none { width: 96px; height: 64px; border-radius: 0.5rem; border: 1px dashed #374151; display: flex; align-items: center; justify-content: center; font-size: 0.65rem; color: #4b5563; flex-shrink: 0; text-align: center; }
+
+        .image-picker-overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.75); backdrop-filter: blur(3px);
+            display: flex; align-items: center; justify-content: center; z-index: 210; padding: 1rem;
+        }
+        .image-picker-modal {
+            width: 100%; max-width: 620px; max-height: 85vh; overflow-y: auto; background: #0d0d0d;
+            border: 1px solid #1f2937; border-radius: 1rem; padding: 1.5rem;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+        }
+        .image-picker-modal h3 { font-size: 1.05rem; font-weight: 700; color: #f3f4f6; margin-bottom: 1rem; }
+        .image-picker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 0.6rem; margin-bottom: 1.25rem; }
+        .image-picker-grid-empty { font-size: 0.8rem; color: #6b7280; padding: 0.75rem 0; }
+        .image-picker-thumb-btn { border: 2px solid transparent; border-radius: 0.5rem; padding: 0; cursor: pointer; background: none; overflow: hidden; }
+        .image-picker-thumb-btn:hover { border-color: #2597e8; }
+        .image-picker-thumb-btn img { width: 100%; height: 76px; object-fit: cover; display: block; }
+        .image-picker-upload-row { border-top: 1px solid #1f2937; padding-top: 1rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+
+        .gauge-wrap { display: flex; align-items: center; gap: 1rem; }
+        .gauge { width: 64px; height: 64px; border-radius: 50%; display: flex; align-items: center; justify-content: center; position: relative; flex-shrink: 0; }
+        .gauge .gauge-label { font-size: 0.9rem; font-weight: 800; font-family: 'Courier New', monospace; }
+
+        .blink { animation: blink-anim 1s step-start infinite; }
+        @keyframes blink-anim { 50% { opacity: 0; } }
+
+        body.light-mode .panel { border-color: #e5e7eb; background: rgba(0,0,0,0.015); }
+        body.light-mode .system-cell { background: #fff; border-color: #e5e7eb; }
+        body.light-mode .feature-row { background: #fff; border-color: #e5e7eb; }
+        body.light-mode .activity-row { border-color: #f0f0f0; }
+    </style>
+    <style>
+    /* Cookie consent banner (site-wide) */
+    .cr-consent-banner { position: fixed; left: 0; right: 0; bottom: 0; z-index: 500; background: #0d0d0d; border-top: 1px solid rgba(255,255,255,0.1); padding: 1.1rem 1.5rem; display: none; }
+    .cr-consent-banner.open { display: block; }
+    .cr-consent-inner { max-width: 64rem; margin: 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; }
+    .cr-consent-text { flex: 1; min-width: 220px; font-size: 0.82rem; color: #9ca3af; line-height: 1.5; }
+    .cr-consent-text a { color: #2597E8; text-decoration: underline; }
+    .cr-consent-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+    .cr-consent-btn { font-size: 0.82rem; font-weight: 600; padding: 0.55rem 1.1rem; border-radius: 8px; cursor: pointer; white-space: nowrap; font-family: inherit; }
+    .cr-consent-btn-accept { background: #2597e8; color: #fff; border: none; }
+    .cr-consent-btn-accept:hover { opacity: 0.9; }
+    .cr-consent-btn-essential { background: transparent; color: #d1d5db; border: 1px solid #374151; }
+    .cr-consent-btn-essential:hover { border-color: #6b7280; color: #fff; }
+    body.light-mode .cr-consent-banner { background: #ffffff; border-top-color: #e5e7eb; }
+    body.light-mode .cr-consent-text { color: #4b5563; }
+    body.light-mode .cr-consent-btn-essential { color: #374151; border-color: #d1d5db; }
+    @media (max-width: 640px) { .cr-consent-inner { flex-direction: column; align-items: stretch; } .cr-consent-actions { justify-content: stretch; } .cr-consent-btn { flex: 1; } }
+    
+    .cr-appshell-menu-btn{display:none;background:none;border:none;cursor:pointer;padding:6px;margin-left:6px;}
+    .cr-appshell-menu-btn span{display:block;width:20px;height:2px;background:#d1d5db;margin:4px 0;border-radius:2px;transition:transform .25s ease,opacity .2s ease;}
+    .cr-appshell-menu-btn.open span:nth-child(1){transform:translateY(6px) rotate(45deg);}
+    .cr-appshell-menu-btn.open span:nth-child(2){opacity:0;}
+    .cr-appshell-menu-btn.open span:nth-child(3){transform:translateY(-6px) rotate(-45deg);}
+    .cr-appshell-mobile-menu{display:none;flex-direction:column;gap:2px;background:#0b0d12;border-bottom:1px solid #1f2937;padding:10px 20px 16px;}
+    .cr-appshell-mobile-menu.open{display:flex;}
+    .cr-appshell-mlink{font-size:14.5px;font-weight:500;color:#d1d5db;text-decoration:none;padding:10px 6px;border-radius:8px;transition:color .2s ease,background .2s ease;}
+    .cr-appshell-mlink:hover{color:#15A6DE;background:rgba(255,255,255,0.04);}
+    @media (max-width:700px){.cr-appshell-menu-btn{display:inline-flex;flex-direction:column;justify-content:center;}}
+
+    </style>
+
+<!-- CR_MOBILE_START do not hand-edit  regenerate with _mobile_sweep.py -->
+<style id="cr-mobile">
+/* ================================================================
+   CoreRipper mobile override layer (<=768px).
+   Keeps every desktop layout untouched; overrides only sizing,
+   spacing, tap targets and grid direction for phones. All
+   animations are preserved. Regenerate via _mobile_sweep.py.
+   ================================================================ */
+@media (max-width: 768px) {
+  html, body { max-width: 100vw; overflow-x: hidden; -webkit-text-size-adjust: 100%; }
+  body { font-size: 15px; line-height: 1.55; }
+
+  /* Kill horizontal overflow from any oversized child */
+  img, video, canvas, svg, iframe, table, pre, code { max-width: 100%; }
+  img, video, canvas, iframe { height: auto; }
+  pre, code, .mono-cell { overflow-x: auto; word-break: break-word; -webkit-overflow-scrolling: touch; }
+  table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* Standardize container padding site-wide */
+  main, .container, .max-w-7xl, .max-w-6xl, .max-w-5xl, .max-w-4xl,
+  .max-w-3xl, .max-w-2xl, .max-w-xl, .max-w-lg, .max-w-md, .max-w-sm {
+    padding-left: 16px !important; padding-right: 16px !important;
+    max-width: 100% !important;
+  }
+
+  /* Collapse all common multi-column grids to a single column */
+  .grid-cols-2, .grid-cols-3, .grid-cols-4, .grid-cols-5,
+  .md\:grid-cols-2, .md\:grid-cols-3, .md\:grid-cols-4,
+  .lg\:grid-cols-2, .lg\:grid-cols-3, .lg\:grid-cols-4,
+  .sm\:grid-cols-2, .sm\:grid-cols-3 {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Two-column layouts used site-wide (Workbench, hero splits) */
+  .cr-half { flex: 0 0 100% !important; width: 100% !important; max-width: 100% !important; }
+  .cr-frame, .cr-bar { flex-wrap: wrap !important; }
+
+  /* Nav / header: keep the site's own hamburger, hide desktop link row + top CTA.
+     support.html (and any other page following the same pattern) nests its
+     hamburger button *inside* .nav-links, so blindly hiding the whole
+     container took the hamburger down with it  leaving zero way to
+     navigate or reach the mobile menu on that page. Hide only the link
+     children, and force the hamburger back on regardless of which
+     container it's nested in. */
+  .cr-nav-links > *, .nav-links > a, .desktop-nav > * { display: none !important; }
+  .nav-links .cr-appshell-menu-btn, .nav-links .cr-menu-btn { display: inline-flex !important; }
+  nav .cta-btn, header .cta-btn, .site-header .cta-btn { display: none !important; }
+  .cr-nav, header nav, .site-header { padding-left: 12px !important; padding-right: 12px !important; }
+  .cr-menu-btn, #crMenuBtn, .hamburger, .mobile-menu-btn { display: inline-flex !important; }
+
+  /* Logged-in header overflow fix (2026-07-31): the credit chip + account
+     dropdown replace Login/Get Started once a user is signed in, but at
+     phone widths those two plus the hamburger plus the decorative search
+     icon never fit on one row  the username label (up to 130px on desktop)
+     pushed the hamburger button off-screen entirely, so a logged-in user on
+     mobile had no way to open the nav menu at all. Fix: drop the decorative
+     search icon, shrink the credit chip and truncate the username hard, and
+     pin the hamburger so it can never be squeezed out. */
+  nav svg[stroke="#9ca3af"], .ts-nav-right > svg,
+  nav button:has(> svg.anim-scan) { display: none !important; }
+  nav .flex.items-center.gap-4, nav .flex.items-center.gap-3 { gap: 6px !important; }
+  .ts-nav-right { gap: 8px !important; flex-wrap: nowrap !important; }
+  .cr-credit-chip { padding: 5px 8px !important; font-size: 12px !important; gap: 4px !important; }
+  .cr-credit-chip svg { width: 11px !important; height: 11px !important; }
+  .cr-nav-dropdown .cr-dd-btn {
+    padding: 5px 6px !important; gap: 3px !important; flex-shrink: 1 !important; min-width: 0 !important;
+  }
+  .cr-nav-dropdown .cr-dd-btn #navUserLabel, #navUserLabel {
+    max-width: 54px !important; font-size: 12px !important;
+  }
+  .cr-nav-dropdown .cr-dd-chevron { flex-shrink: 0 !important; width: 10px !important; height: 10px !important; }
+  .cr-menu-btn, .ts-menu-btn, #tsMenuBtn { flex-shrink: 0 !important; margin-left: 2px !important; }
+  #crCreditWrap, .cr-credit-wrap { flex-shrink: 1 !important; min-width: 0 !important; }
+
+  /* settings.html/billing.html/support.html's header carries a "Dashboard"
+     text link and a "Back to Site" button alongside the hamburger and
+     account dropdown  on top of the app-shell menu button, that's 4-5
+     interactive elements crammed in one row, wide enough to push the
+     account dropdown itself off the right edge of a phone screen entirely
+     (confirmed: navUserWrap rendered at x=402 on a 375px-wide viewport).
+     Both links duplicate destinations already one tap away (Workbench via
+     the dropdown, Home via the logo), so they're the ones to drop, not the
+     hamburger or the dropdown. */
+  .wb-nav-inner a[href="dashboard.html"], .wb-nav-inner .secondary-btn,
+  .wb-nav-inner .nav-back { display: none !important; }
+  .cr-appshell-menu-btn, #navUserWrap.cr-nav-dropdown { flex-shrink: 0 !important; }
+
+  /* Nav dropdowns on mobile: same as desktop (absolute below trigger),
+     just ensure they don't overflow the viewport. Closes on outside tap
+     via the script block below. */
+  .cr-dd-menu {
+    max-width: calc(100vw - 24px) !important;
+    max-height: 70vh !important; overflow-y: auto !important;
+    z-index: 9999 !important;
+  }
+  .cr-dd-menu .cr-dd-item {
+    padding: 12px 18px !important; font-size: 14px !important;
+  }
+  .cr-dd-menu .cr-dd-email {
+    padding: 8px 18px 4px !important; font-size: 12px !important;
+  }
+  .cr-dd-menu .cr-dd-divider { margin: 4px 14px !important; }
+  /* Dashboard's own user dropdown */
+  .wb-user-dropdown {
+    max-width: calc(100vw - 24px) !important;
+    max-height: 70vh !important; overflow-y: auto !important;
+    z-index: 9999 !important;
+  }
+  .wb-dd-item { padding: 12px 18px !important; font-size: 14px !important; }
+  /* Credit dropdown */
+  .cr-credit-menu {
+    max-width: calc(100vw - 24px) !important;
+    max-height: 70vh !important; overflow-y: auto !important;
+    z-index: 9999 !important;
+  }
+
+  /* Tap targets  minimum 40x40 for anything interactive in headers/menus.
+     Deliberately excludes plain footer text links: those get their own
+     compact sizing below (footer is a dense link list, not primary nav),
+     and forcing 40px per link there was bloating the footer's height. */
+  .cr-nav a, .cr-nav button, .nav-link, .cr-dd-item, .cr-menu-btn,
+  header a, header button, .site-header a, .site-header button
+  { min-height: 40px; display: inline-flex; align-items: center; }
+  button, .btn, [role="button"], input[type="submit"], input[type="button"] {
+    min-height: 40px; padding-top: 10px; padding-bottom: 10px;
+  }
+
+  /* Forms: full-width, 16px font (prevents iOS zoom-on-focus) */
+  input, select, textarea {
+    font-size: 16px !important; width: 100%; box-sizing: border-box;
+    min-height: 44px;
+  }
+  textarea { min-height: 96px; }
+  form .row, form .field-group { flex-direction: column !important; gap: 10px !important; }
+
+  /* Headings / hero */
+  h1 { font-size: clamp(24px, 6.5vw, 32px) !important; line-height: 1.2 !important; }
+  h2 { font-size: clamp(20px, 5.5vw, 26px) !important; line-height: 1.25 !important; }
+  h3 { font-size: clamp(17px, 4.6vw, 20px) !important; }
+  .hero, .hero-section, section.hero { padding-top: 32px !important; padding-bottom: 32px !important; }
+
+  /* Cards / tool cards  tighter on phones */
+  .card, .tool-card, .ts-card, .ts-price-card, .ts-newscard, .ts-chipcard,
+  .cr-card, .s-card {
+    padding: 16px !important; border-radius: 12px !important;
+  }
+
+  /* ================================================================
+     Tool hub pages (net_tools / dev_tools / ai_tools)
+     ================================================================ */
+  /* Tool cards  compact layout on phones: smaller icon, tighter spacing */
+  .tool-card .icon-box { width: 40px !important; height: 40px !important; border-radius: 10px !important; }
+  .tool-card .icon-box svg { width: 20px !important; height: 20px !important; }
+  .tool-card h4 { font-size: 15px !important; }
+  .tool-card p { font-size: 13px !important; margin-bottom: 10px !important; }
+  .tool-card a { font-size: 13px !important; }
+  /* Badges (FREE / PREMIUM / COMING SOON / lock)  keep inline, don't overlap */
+  .badge { font-size: 0.65rem !important; padding: 0.15rem 0.5rem !important; }
+  .badge-soon { font-size: 0.6rem !important; }
+  .lock-badge, .tool-lock-badge { font-size: 10px !important; padding: 2px 7px !important; }
+  .upgrade-hint { font-size: 11px !important; }
+  /* net_tools.html's "Email/Domain Breach Check" card hardcodes its Coming
+     Soon badge as an inline `position:absolute; top:14px; right:14px` span
+     instead of using the .badge-soon class the other cards use  the other
+     cards' badges got caught by the rule above, this one didn't, and at
+     phone widths the card title wraps to two lines right under it, so the
+     badge sits on top of the word "Check". !important here beats the
+     inline style same as everywhere else in this stylesheet. */
+  .tool-card > span[style*="position:absolute"] {
+    position: static !important; display: inline-block !important;
+    margin: 0 0 10px !important;
+  }
+  /* Category sections  tighter accordion headers */
+  .category-toggle { padding: 14px 0 !important; }
+  .category-toggle h3 { font-size: 16px !important; }
+  /* Search bar on hub pages */
+  .search-wrap { margin-bottom: 20px !important; }
+  .search-wrap input { font-size: 15px !important; padding: 12px 14px !important; }
+  /* Tab buttons (DNS/SSL/Ping etc. on net_tools) */
+  .tab-btn { padding: 10px 12px !important; font-size: 13px !important; white-space: nowrap; }
+  /* Results area */
+  .result-card { padding: 14px !important; }
+  .result-label { font-size: 0.8rem !important; }
+  .result-value { font-size: 13px !important; }
+
+  /* ================================================================
+     Individual tool pages (networking/*, dev-tools/*, ai-tools/*)
+     ================================================================ */
+  /* Hero input area  full width, stack form elements */
+  .tool-hero, .tool-input-area, .input-section {
+    padding: 20px 14px !important;
+  }
+  /* Result panels + terminal output */
+  .result-panel, .output-panel, pre.result, .terminal, .code-output {
+    font-size: 12.5px !important; padding: 12px !important; border-radius: 10px !important;
+  }
+  /* Copy buttons inside result blocks */
+  .copy-btn, [data-copy], button[onclick*="copy"] {
+    font-size: 11px !important; padding: 4px 8px !important;
+  }
+
+  /* ================================================================
+     Content pages (blog / news / hardware)
+     ================================================================ */
+  /* Article card grids  these use Tailwind grids which are already collapsed,
+     but the cards themselves need tighter spacing */
+  .article-card, .news-card, .hw-card, .blog-card, .post-card {
+    padding: 14px !important; border-radius: 12px !important;
+  }
+  .article-card img, .news-card img, .hw-card img, .blog-card img {
+    border-radius: 10px !important; margin-bottom: 10px !important;
+  }
+  /* Filter/tag strips on content pages */
+  .filter-bar, .tag-bar, .content-filters {
+    overflow-x: auto !important; flex-wrap: nowrap !important;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    gap: 8px !important; padding-bottom: 4px;
+  }
+  .filter-bar::-webkit-scrollbar, .tag-bar::-webkit-scrollbar,
+  .content-filters::-webkit-scrollbar { display: none; }
+  /* Article detail pages  readable line length */
+  .article-body, .post-body, .post-content, .blog-content {
+    font-size: 15px !important; line-height: 1.7 !important;
+    padding: 0 !important;
+  }
+  .article-body h2, .post-body h2, .blog-content h2 { font-size: 20px !important; margin-top: 28px !important; }
+  .article-body h3, .post-body h3, .blog-content h3 { font-size: 17px !important; }
+  .article-body img, .post-body img { border-radius: 10px !important; }
+  .article-body pre, .post-body pre { font-size: 12px !important; padding: 12px !important; overflow-x: auto; }
+  /* Sidebar on content pages  collapse below main content */
+  .content-sidebar, .blog-sidebar, .article-sidebar {
+    position: static !important; width: 100% !important;
+    margin-top: 24px !important;
+  }
+
+  /* ================================================================
+     Account pages (settings / billing / support)
+     ================================================================ */
+  /* Section cards on settings/billing  full-width, no side padding excess */
+  .settings-card, .billing-card, .account-section, .support-card {
+    padding: 16px !important; border-radius: 12px !important;
+  }
+  /* Plan cards on billing  single column */
+  .plan-grid, .plans-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
+  /* Mobile money operator tiles (billing.html)  2 columns at most */
+  .pm-tiles { grid-template-columns: 1fr 1fr !important; gap: 8px !important; }
+  /* Payment form  stack amount/method fields */
+  .payment-form, .checkout-form { padding: 16px !important; }
+  .payment-row, .checkout-row { flex-direction: column !important; gap: 10px !important; }
+  /* Active sessions list on settings */
+  .session-row, .device-row {
+    flex-direction: column !important; align-items: flex-start !important;
+    gap: 6px !important; padding: 12px !important;
+  }
+  /* Support ticket form */
+  .ticket-form textarea { min-height: 120px !important; }
+
+  /* ================================================================
+     Pricing page
+     ================================================================ */
+  /* Price comparison cards  single column, compact */
+  .pricing-grid, .price-grid { grid-template-columns: 1fr !important; gap: 14px !important; }
+  .pricing-card, .price-card {
+    padding: 20px 16px !important; border-radius: 14px !important;
+  }
+  .pricing-card .price, .price-card .amount { font-size: 28px !important; }
+  /* Comparison table  horizontal scroll */
+  .comparison-table, .feature-table { display: block !important; overflow-x: auto !important; }
+  .comparison-table th, .comparison-table td { white-space: nowrap !important; font-size: 12px !important; padding: 8px 10px !important; }
+
+  /* ================================================================
+     Auth pages (login / signup / forgot / reset)
+     ================================================================ */
+  .auth-card, .cr-auth-card {
+    width: 100% !important; max-width: none !important;
+    margin: 16px auto !important; padding: 20px 16px !important;
+    border-radius: 14px !important;
+  }
+  .auth-card h1, .cr-auth-card h1 { font-size: 22px !important; }
+  .auth-card .auth-logo, .cr-auth-card .auth-logo { margin-bottom: 16px !important; }
+  /* Google sign-in button  full width */
+  .g_id_signin, [data-google-btn], .google-btn-wrap {
+    width: 100% !important; max-width: none !important;
+  }
+  /* Divider ("or") */
+  .auth-divider, .or-divider { margin: 16px 0 !important; }
+
+  /* ================================================================
+     Admin / Engine Room (admin.html)
+     ================================================================ */
+  .admin-tabs, .engine-tabs {
+    overflow-x: auto !important; flex-wrap: nowrap !important;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    gap: 4px !important;
+  }
+  .admin-tabs::-webkit-scrollbar, .engine-tabs::-webkit-scrollbar { display: none; }
+  .admin-tab, .engine-tab {
+    flex-shrink: 0 !important; font-size: 12px !important;
+    padding: 8px 12px !important; white-space: nowrap;
+  }
+  /* Admin cards/tables */
+  .admin-card, .engine-card { padding: 14px !important; border-radius: 12px !important; }
+  .admin-table, .engine-table { display: block !important; overflow-x: auto !important; font-size: 12px !important; }
+  .admin-table th, .admin-table td { padding: 6px 8px !important; white-space: nowrap !important; }
+  /* Moderation cards  stack image + content */
+  .mod-card { flex-direction: column !important; }
+  .mod-card img { width: 100% !important; max-height: 200px !important; object-fit: cover !important; border-radius: 10px !important; }
+
+  /* Homepage tool-showcase slideshow  keep the animation, cap the height */
+  .ts-viewport { height: auto !important; min-height: 340px; }
+  .ts-slide { padding: 22px 18px !important; }
+  .ts-slide-name { font-size: 17px !important; }
+  .ts-slide-desc { font-size: 13px !important; max-width: 100% !important; }
+  .ts-slide-icon { width: 40px !important; height: 40px !important; }
+  .ts-slide-icon svg { width: 22px !important; height: 22px !important; }
+
+  /* Homepage pricing / feature grids */
+  .ts-price-card { padding: 20px 18px !important; }
+  .ts-price-amount { font-size: 30px !important; }
+
+  /* Section paddings across the site */
+  section, .section, .ts-sec { padding-top: 36px !important; padding-bottom: 36px !important; }
+  .ts-sec-inner, section > .container, section > div { padding-left: 16px !important; padding-right: 16px !important; }
+
+  /* Footer  keep the site's own 2-col link grid (it's already mobile-tuned),
+     just tighten it further so it doesn't run long. Brand block always
+     spans the full row above the link columns. */
+  .cr-footer { padding: 20px 16px 10px !important; }
+  .cr-footer-grid {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    gap: 10px 16px !important;
+    margin-bottom: 10px !important;
+  }
+  .cr-footer-brand-col { grid-column: 1 / -1 !important; margin-bottom: 4px; }
+  .cr-footer-brand-col, .cr-footer-col { max-width: 100%; }
+  .cr-footer-col { gap: 4px !important; }
+  .cr-footer-col .head { font-size: 11px !important; margin-bottom: 2px !important; }
+  .cr-footer-col a { font-size: 13px !important; line-height: 1.5 !important; }
+  .cr-footer-blurb { font-size: 12.5px !important; margin: 2px 0 !important; }
+  footer .cr-footer-social { justify-content: flex-start !important; gap: 12px !important; }
+  /* Social icons are icon-only links  they still need a real tap target,
+     unlike the plain text links above. */
+  .cr-footer-social a { min-height: 40px !important; min-width: 40px !important; justify-content: center !important; }
+  .cr-footer-bottom { flex-direction: column !important; align-items: flex-start !important; padding-top: 10px !important; }
+  /* Non-.ts-* generic footer/grid containers elsewhere on the page still stack */
+  footer .grid:not(.cr-footer-grid) { grid-template-columns: 1fr !important; }
+
+  /* Cookie / consent banner  no bottom-right overlap of key UI */
+  .cr-consent-banner { left: 8px !important; right: 8px !important; bottom: 8px !important;
+    max-width: none !important; padding: 14px !important; border-radius: 12px !important; }
+  .cr-consent-inner, .cr-consent-actions { flex-direction: column !important; align-items: stretch !important; gap: 10px !important; }
+  .cr-consent-btn { width: 100% !important; }
+
+  /* Modals / dialogs */
+  .modal, .cr-modal, dialog, [role="dialog"] {
+    width: calc(100vw - 24px) !important; max-width: calc(100vw - 24px) !important;
+    max-height: calc(100vh - 24px) !important; overflow-y: auto !important;
+    padding: 18px !important; border-radius: 14px !important;
+  }
+
+  /* ================================================================
+     Dashboard / Workbench  comprehensive phone + tablet layout
+     ================================================================ */
+  /* Nav bar  compact, no overflow */
+  .wb-nav-inner {
+    padding: 0 12px !important; height: 54px !important; gap: 10px !important;
+  }
+  .wb-nav-inner .cr-logo { gap: 6px !important; }
+  .wb-nav-inner .cr-logo-tile { width: 28px !important; height: 28px !important; }
+  .wb-nav-inner .cr-logo-tile svg { width: 20px !important; height: 20px !important; }
+  .wb-nav-inner .cr-wordmark { font-size: 15px !important; }
+  /* Hide the "Workbench" title + plan pill filler block  scoped with :has()
+     to the one div that actually contains .wb-premium-pill, since settings/
+     billing/support also share the .wb-nav-inner class but put a completely
+     different 2nd child there (the Dashboard link + hamburger + Back to Site
+     + account-dropdown actions group). An un-scoped nth-child(2) previously
+     nuked that whole actions group on those three pages  including the only
+     way to open the account dropdown or log out on mobile. */
+  .wb-nav-inner > div:nth-child(2):has(.wb-premium-pill) { display: none !important; }
+  .wb-premium-pill { font-size: 10px !important; padding: 3px 8px !important; }
+  .wb-credits-pill { padding: 5px 8px !important; }
+  .wb-credits-pill .mono { font-size: 11px !important; }
+  #navRight { gap: 8px !important; }
+
+  /* Header band  tighter padding */
+  .wb-header-inner { padding: 20px 14px 0 !important; }
+  .wb-h1 { font-size: 22px !important; }
+  .wb-subtitle { font-size: 13px !important; }
+  .wb-tabs { gap: 18px !important; margin-top: 14px !important; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .wb-tabs::-webkit-scrollbar { display: none; }
+  .wb-tab-btn { font-size: 13px !important; white-space: nowrap; flex-shrink: 0; }
+
+  /* Run bar  stack vertically */
+  .wb-runbar-wrap { padding: 14px 12px 0 !important; }
+  .wb-runbar { padding: 14px !important; flex-direction: column !important; gap: 12px !important; border-radius: 12px !important; }
+  .wb-runbar > div, .wb-runbar > label { width: 100% !important; }
+  .wb-run-btn { width: 100% !important; text-align: center !important; }
+
+  /* Main 3-col grid  single column */
+  .wb-grid {
+    grid-template-columns: 1fr !important; padding: 14px 12px 80px !important; gap: 14px !important;
+  }
+  .wb-sidebar-col, .wb-rightrail-col {
+    position: static !important; max-height: none !important;
+    overflow-y: visible !important;
+  }
+  /* On phones, move sidebar (tool picker) above main stream */
+  .wb-sidebar-col { order: -1 !important; }
+
+  /* Cards  slightly tighter */
+  .wb-card { padding: 12px 14px !important; border-radius: 11px !important; }
+  .wb-result-card { padding: 14px !important; border-radius: 12px !important; }
+  .wb-result-card:hover { transform: none !important; }
+  .wb-card-head { gap: 8px !important; }
+
+  /* Tool picker  horizontal scroll strip instead of full sidebar list */
+  .wb-tool-row { padding: 7px 8px !important; font-size: 12px !important; }
+  .wb-add-row { flex-direction: column !important; }
+
+  /* Batch progress  wrap chips */
+  .wb-batch { padding: 12px 14px !important; border-radius: 11px !important; }
+  .wb-batch-head { gap: 8px !important; }
+  .wb-batch-chips { gap: 6px !important; }
+  .wb-batch-chip { font-size: 11px !important; }
+  .wb-batch-save-row { flex-direction: column !important; gap: 8px !important; align-items: stretch !important; }
+
+  /* Flat grid results (key-value pairs inside result cards) */
+  .wb-flat-grid { grid-template-columns: 1fr !important; gap: 8px !important; }
+
+  /* Tables inside results  stack into cards */
+  .wb-table-wrap { margin-bottom: 10px !important; }
+  .wb-table th { font-size: 10px !important; padding: 5px 6px !important; }
+  .wb-table td { font-size: 11.5px !important; padding: 5px 6px !important; white-space: normal !important; }
+
+  /* Diff rows  stack before/after */
+  .wb-diff-row { flex-direction: column !important; gap: 8px !important; }
+  .wb-diff-box { min-width: 0 !important; }
+
+  /* Stream filters  scrollable */
+  .wb-filters { overflow-x: auto !important; flex-wrap: nowrap !important; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 4px; }
+  .wb-filters::-webkit-scrollbar { display: none; }
+  .wb-filter-pill { flex-shrink: 0 !important; font-size: 11.5px !important; }
+
+  /* Actions row  wrap buttons */
+  .wb-actions-row { gap: 6px !important; }
+  .wb-btn-ghost, .wb-btn-primary { font-size: 11.5px !important; padding: 6px 10px !important; }
+
+  /* Saved Results view */
+  .wb-saved-wrap { padding: 16px 12px 80px !important; }
+  .wb-project-card { padding: 14px !important; }
+  .wb-project-row { gap: 8px !important; }
+  .wb-loose-row { padding: 10px 12px !important; gap: 8px !important; }
+
+  /* Floating Assistant  bottom-sheet (phones; tablet uses page's own 640px rule) */
+  .wb-assistant-panel {
+    left: 0 !important; right: 0 !important; bottom: 0 !important; top: auto !important;
+    width: 100% !important; height: 70vh !important; max-height: calc(100vh - 60px) !important;
+    border-radius: 18px 18px 0 0 !important; resize: none !important;
+  }
+  .wb-assistant-head { cursor: default !important; }
+  .wb-assistant-grip, .wb-assistant-resize { display: none !important; }
+  .wb-assistant-body { padding: 12px 14px !important; }
+  .wb-msg-bubble { max-width: 90% !important; font-size: 13px !important; }
+  .wb-assistant-input-row { padding: 10px 12px calc(env(safe-area-inset-bottom, 8px) + 10px) !important; }
+
+  /* FAB  smaller on phone, stay above bottom-sheet */
+  .wb-assistant-toggle { right: 14px !important; bottom: 14px !important; width: 46px !important; height: 46px !important; }
+
+  /* Monitors add-form inside right rail  full-width fields */
+  .wb-phone-wrap { border-radius: 8px !important; }
+  .wb-dial-dropdown { left: 12px !important; right: 12px !important; width: auto !important; max-width: none !important; }
+
+  /* Modal  full-width on phones */
+  .wb-modal { padding: 20px 16px !important; max-width: calc(100vw - 24px) !important; border-radius: 14px !important; }
+  .wb-toast { left: 12px !important; right: 12px !important; bottom: 16px !important; transform: none !important; text-align: center !important; }
+
+  /* Gate/access screens */
+  .wb-gate-wrap { min-height: 50vh !important; padding: 30px 16px !important; }
+
+  /* Empty state */
+  .wb-empty { padding: 36px 16px !important; }
+
+  /* New section button */
+  .wb-new-section { padding: 10px !important; font-size: 12px !important; }
+
+  /* Code blocks inside results  allow scroll */
+  .wb-code-text { font-size: 11.5px !important; padding-right: 40px !important; }
+
+  /* Tool pages  the tool nav rail collapses to a horizontal scroller */
+  .tool-nav, .tool-nav-list, .sidebar-tools {
+    display: flex !important; flex-direction: row !important; overflow-x: auto !important;
+    white-space: nowrap; gap: 8px !important; padding: 8px !important;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .tool-nav::-webkit-scrollbar { display: none; }
+  .tool-nav-link { flex: 0 0 auto !important; }
+
+  /* Result panels on tool pages */
+  .result-panel, .output-panel, pre.result, .terminal { font-size: 13px !important; }
+
+  /* Key/value result rows (subnet calc, SSL checker, JWT decoder, hash
+     generator, etc.)  stack label above value instead of forcing a fixed
+     label column that crushes the value into a sliver and, combined with
+     word-break:break-all, wraps it one character per line. */
+  .kv-row {
+    flex-direction: column !important; align-items: flex-start !important;
+    gap: 4px !important; padding: 10px 14px !important;
+  }
+  .kv-label { flex: none !important; width: 100% !important; font-weight: 600 !important; }
+  .kv-value { flex: none !important; width: 100% !important; }
+
+  /* Real multi-row results tables (.data-table  DNS propagation, MX/NS
+     lookup, port scanner, traceroute, etc.)  collapse into stacked cards
+     instead of a horizontally-scrolling grid. Relies on each <td> carrying
+     a data-label attribute matching its column header (see individual
+     tool pages' render functions). */
+  .data-table { display: block !important; width: 100% !important; border: none !important; }
+  .data-table thead { display: none !important; }
+  .data-table tbody, .data-table tr { display: block !important; width: 100% !important; }
+  .data-table tr {
+    margin-bottom: 10px !important; border: 1px solid rgba(255,255,255,0.08) !important;
+    border-radius: 10px !important; padding: 4px 12px !important;
+    background: rgba(255,255,255,0.02) !important;
+  }
+  .data-table td {
+    display: flex !important; justify-content: space-between !important; align-items: center !important;
+    gap: 12px !important; padding: 8px 0 !important; border-bottom: 1px solid rgba(255,255,255,0.06) !important;
+    text-align: right !important; white-space: normal !important;
+  }
+  .data-table tr td:last-child { border-bottom: none !important; }
+  .data-table td::before {
+    content: attr(data-label); font-weight: 600; color: #9ca3af; font-size: 0.72rem;
+    text-transform: uppercase; letter-spacing: 0.02em; flex: 0 0 auto; text-align: left; padding-right: 10px;
+  }
+  body.light-mode .data-table tr { border-color: rgba(0,0,0,0.08) !important; background: rgba(0,0,0,0.015) !important; }
+  body.light-mode .data-table td { border-bottom-color: rgba(0,0,0,0.06) !important; }
+  body.light-mode .data-table td::before { color: #6b7280; }
+
+  /* Auth pages (login/signup/forgot/reset) */
+  .auth-card, .cr-auth-card { width: 100% !important; max-width: 420px !important; margin: 24px auto !important; padding: 22px !important; }
+
+  /* Splash screen scale on small phones */
+  .cr-splash .cr-lockup { transform: scale(0.85); }
+
+  /* Long words / URLs shouldn't blow out cards */
+  p, li, td, dd, .card, .tool-card, .s-card { overflow-wrap: anywhere; }
+
+  /* Buttons never wrap to two lines from padding on narrow screens */
+  .btn, button { white-space: normal; }
+
+  /* Absolute-positioned decorative blobs often push scrollbars  contain them */
+  .decor, .bg-blob, .cr-blob, [data-decor] { max-width: 100vw; overflow: hidden; }
+
+  /* ---- Homepage (index.html) ts-* specific overrides ---- */
+  .ts-nav-inner { padding: 0 14px !important; height: 56px !important; }
+  .ts-nav-links, .ts-nav-right .ts-cta, .ts-nav-right .ts-btn-primary { display: none !important; }
+  .ts-menu-btn { display: inline-flex !important; }
+  .ts-hero, .ts-hero-inner { padding: 32px 16px 40px !important; }
+  .ts-hero-grid { grid-template-columns: 1fr !important; gap: 24px !important; }
+  .ts-search { padding: 32px 16px 40px !important; }
+  .ts-cats { padding: 40px 16px !important; }
+  .ts-cats-grid { grid-template-columns: 1fr !important; gap: 14px !important; }
+  .ts-sec { padding: 40px 16px !important; }
+  .ts-sec-head { flex-direction: column !important; align-items: flex-start !important; gap: 14px !important; }
+  .ts-footer { padding: 36px 16px 28px !important; }
+  .ts-footer-grid, .ts-footer-inner .grid { grid-template-columns: 1fr !important; gap: 22px !important; }
+  .ts-price-grid, .ts-features-grid, .ts-pillars-grid { grid-template-columns: 1fr !important; gap: 16px !important; }
+  .ts-wb-mock-side { display: none !important; }
+  .ts-wb-mock-main { width: 100% !important; }
+  .ts-mon-panel, .ts-chipcard { padding: 16px !important; }
+  .ts-slider-frame, .ts-window-wrap { max-width: 100% !important; }
+
+  /* Newsletter box  tighten padding/margins so the section doesn't eat a
+     full extra screen of scrolling on phones. */
+  .ts-newsletter-box { padding: 28px 18px !important; }
+  .ts-newsletter-box h2 { font-size: 24px !important; margin-bottom: 8px !important; }
+  .ts-newsletter-box p.sub { font-size: 14px !important; margin-bottom: 16px !important; }
+  .ts-newsletter-tags { margin-bottom: 16px !important; gap: 6px !important; }
+
+  /* Newsletter "already subscribed" banner  wrap instead of overlapping
+     the Subscribe/Unsubscribe button against the status text. */
+  .ts-newsletter-success {
+    flex-wrap: wrap !important; justify-content: center !important;
+    text-align: center !important; padding: 14px 18px !important;
+  }
+  #newsletterToggleBtn { margin-left: 0 !important; margin-top: 6px !important; }
+}
+
+/* --- Extra tightening for very small phones (<=480px) --- */
+@media (max-width: 480px) {
+  body { font-size: 14.5px; }
+  main, .container, .max-w-7xl, .max-w-6xl, .max-w-5xl, .max-w-4xl,
+  .max-w-3xl, .max-w-2xl { padding-left: 12px !important; padding-right: 12px !important; }
+  section, .section, .ts-sec { padding-top: 28px !important; padding-bottom: 28px !important; }
+  h1 { font-size: clamp(22px, 7vw, 28px) !important; }
+  .card, .tool-card, .ts-card, .ts-price-card, .cr-card, .s-card { padding: 16px !important; border-radius: 12px !important; }
+  .ts-viewport { min-height: 320px; }
+  .ts-slide { padding: 18px 14px !important; }
+  .ts-slide-name { font-size: 16px !important; }
+  .cr-splash .cr-lockup { transform: scale(0.75); }
+}
+
+/* --- Tablet portrait (481-768px): dashboard gets 2-col grid --- */
+@media (min-width: 481px) and (max-width: 768px) {
+  .wb-grid { grid-template-columns: 1fr 1fr !important; }
+  .wb-sidebar-col { grid-column: 1 / -1 !important; order: -1 !important; }
+  .wb-rightrail-col { grid-column: 1 / -1 !important; }
+  .wb-flat-grid { grid-template-columns: 1fr 1fr !important; }
+  .wb-runbar { flex-direction: row !important; flex-wrap: wrap !important; }
+  .wb-run-btn { width: auto !important; }
+}
+
+/* --- Smallest phones (<=360px, e.g. iPhone SE portrait) --- */
+@media (max-width: 360px) {
+  body { font-size: 14px; }
+  main, .container { padding-left: 10px !important; padding-right: 10px !important; }
+  h1 { font-size: 22px !important; }
+  h2 { font-size: 19px !important; }
+  .ts-slide { padding: 16px 12px !important; }
+  .ts-slide-icon { width: 36px !important; height: 36px !important; }
+  .cr-splash .cr-lockup { transform: scale(0.65); }
+}
+</style>
+<script>
+/* Dropdown close-on-outside-tap (2026-07-31).
+   Tap anywhere outside an open dropdown to close it. Works on both desktop
+   and mobile, for all three dropdown types on every page. */
+document.addEventListener('click', function (e) {
+  var sel = '.cr-dd-menu.open, .wb-user-dropdown.open, .cr-credit-menu.open';
+  var open = document.querySelector(sel);
+  if (!open) return;
+  if (open.contains(e.target)) return;
+  var wrap = open.closest('.cr-nav-dropdown, .wb-user-menu-wrap, .cr-credit-wrap');
+  if (wrap) {
+    var btn = wrap.querySelector('.cr-dd-btn, .wb-user-btn, .cr-credit-chip');
+    if (btn && btn.contains(e.target)) return;
+  }
+  open.classList.remove('open');
+  if (wrap) {
+    var b = wrap.querySelector('.cr-dd-btn, .wb-user-btn, .cr-credit-chip');
+    if (b) b.setAttribute('aria-expanded', 'false');
+  }
+});
+document.addEventListener('keydown', function (e) {
+  if (e.key !== 'Escape') return;
+  var sel = '.cr-dd-menu.open, .wb-user-dropdown.open, .cr-credit-menu.open';
+  var open = document.querySelector(sel);
+  if (!open) return;
+  open.classList.remove('open');
+  var wrap = open.closest('.cr-nav-dropdown, .wb-user-menu-wrap, .cr-credit-wrap');
+  var btn = wrap && wrap.querySelector('.cr-dd-btn, .wb-user-btn, .cr-credit-chip');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+});
+</script>
+<!-- CR_MOBILE_END -->
+</head>
+<body>
+    <div class="cr-consent-banner" id="crConsentBanner" role="dialog" aria-label="Cookie preferences">
+        <div class="cr-consent-inner">
+            <p class="cr-consent-text">We use essential cookies to run CoreRipper, and optional personalization/analytics/advertising cookies to remember things like your theme and improve the free tier. See our <a href="cookie-policy.html">Cookie Policy</a>.</p>
+            <div class="cr-consent-actions">
+                <button class="cr-consent-btn cr-consent-btn-essential" id="crConsentEssential" type="button">Essential only</button>
+                <button class="cr-consent-btn cr-consent-btn-accept" id="crConsentAccept" type="button">Accept all</button>
+            </div>
+        </div>
+    </div>
+    <script>
+    /* === CoreRipper cookie consent (shared) ===
+     * Site has no shared bundle  copied verbatim into every page. Nothing
+     * else on the site reads document.cookie except this (and cr_theme,
+     * gated on personalization consent below); account/session state is a
+     * bearer token in localStorage, never a cookie. */
+    (function () {
+        var COOKIE_NAME = 'cr_consent';
+        var COOKIE_VERSION = '2';
+        var COOKIE_MAX_AGE_DAYS = 365;
+        var THEME_COOKIE_NAME = 'cr_theme';
+
+        function getCookie(name) {
+            var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+            return match ? decodeURIComponent(match[2]) : null;
+        }
+        function setCookie(name, value, maxAgeDays) {
+            var maxAge = maxAgeDays * 24 * 60 * 60;
+            document.cookie = name + '=' + encodeURIComponent(value) + '; max-age=' + maxAge + '; path=/; samesite=Lax';
+        }
+        function deleteCookie(name) {
+            document.cookie = name + '=; max-age=0; path=/; samesite=Lax';
+        }
+        function readConsent() {
+            var raw = getCookie(COOKIE_NAME);
+            if (!raw) return null;
+            try {
+                var parsed = JSON.parse(raw);
+                if (parsed.v !== COOKIE_VERSION) return null; // policy changed -> re-prompt
+                return parsed;
+            } catch (e) { return null; }
+        }
+        function writeConsent(personalization, analytics, advertising) {
+            setCookie(COOKIE_NAME, JSON.stringify({ v: COOKIE_VERSION, personalization: personalization, analytics: analytics, advertising: advertising, ts: Date.now() }), COOKIE_MAX_AGE_DAYS);
+            if (personalization) {
+                syncThemeCookieFromCurrentState();
+            } else {
+                deleteCookie(THEME_COOKIE_NAME);
+            }
+        }
+
+        // Theme persistence (personalization-gated). The toggle checkbox and
+        // its own change handler live in each page's own footer script;
+        // this only reads/writes the cookie so the choice survives reloads.
+        function syncThemeCookieFromCurrentState() {
+            setCookie(THEME_COOKIE_NAME, document.body.classList.contains('light-mode') ? 'light' : 'dark', COOKIE_MAX_AGE_DAYS);
+        }
+        function applyStoredTheme() {
+            var consent = readConsent();
+            if (!consent || !consent.personalization) return;
+            var stored = getCookie(THEME_COOKIE_NAME);
+            if (stored === 'light') document.body.classList.add('light-mode');
+            else if (stored === 'dark') document.body.classList.remove('light-mode');
+        }
+        applyStoredTheme();
+        document.addEventListener('DOMContentLoaded', function () {
+            var themeToggle = document.getElementById('theme-toggle');
+            if (!themeToggle) return;
+            themeToggle.checked = document.body.classList.contains('light-mode');
+            themeToggle.addEventListener('change', function () {
+                var consent = readConsent();
+                if (consent && consent.personalization) syncThemeCookieFromCurrentState();
+            });
+        });
+
+        var banner = document.getElementById('crConsentBanner');
+        function showBanner() { if (banner) banner.classList.add('open'); }
+        function hideBanner() { if (banner) banner.classList.remove('open'); }
+
+        window.CoreRipperConsent = {
+            get: readConsent,
+            has: function (kind) { var c = readConsent(); return !!(c && c[kind]); },
+            reopen: showBanner,
+        };
+
+        var acceptBtn = document.getElementById('crConsentAccept');
+        var essentialBtn = document.getElementById('crConsentEssential');
+        if (acceptBtn) acceptBtn.addEventListener('click', function () { writeConsent(true, true, true); hideBanner(); });
+        if (essentialBtn) essentialBtn.addEventListener('click', function () { writeConsent(false, false, false); hideBanner(); });
+
+        if (!readConsent()) showBanner();
+    })();
+    </script>
+    <div class="cr-splash" id="crSplash">
+      <div class="cr-splash-glow"></div>
+      <div class="cr-lockup" id="crSplashLockup">
+        <div class="cr-icon-wrap">
+          <svg width="56" height="56" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="coreGradient-splash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+              <linearGradient id="pulseGradient-splash" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+              <filter id="neonGlow-splash" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+            </defs>
+            <path class="cr-hex" d="M 32 6 L 52 18 L 52 46 L 32 58 L 12 46 L 12 18 Z" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" />
+            <path class="cr-frame" d="M 32 6 L 12 18 L 12 46 L 24 53" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+            <path class="cr-frame b" d="M 32 58 L 52 46 L 52 18 L 40 11" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+            <path class="cr-shard-a" d="M 32 6 L 40 11" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" />
+            <path class="cr-shard-b" d="M 32 58 L 24 53" stroke="url(#coreGradient-splash)" stroke-width="4" stroke-linecap="round" />
+            <path class="cr-pulse" d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-splash)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-splash)" pathLength="1" />
+          </svg>
+        </div>
+        <div class="cr-wordmark">
+          <span class="cr-word-core">Core</span>
+          <span class="cr-word-ripper-wrap">
+            <span class="cr-half top">Ripper</span>
+            <span class="cr-half bottom">Ripper</span>
+            <span class="cr-rip-streak"></span>
+          </span>
+        </div>
+      </div>
+    </div>
+    <script src="assets/logo/animated-favicon.js"></script>
+    <script>
+    (function () {
+      var splash = document.getElementById('crSplash');
+      if (!splash) return;
+      if (sessionStorage.getItem('crSplashPlayed')) { splash.remove(); return; }
+      sessionStorage.setItem('crSplashPlayed', '1');
+      var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (window.CoreRipperFavicon) { window.CoreRipperFavicon.init(); }
+      // Hold the splash for the full entrance+glow+dim sequence (~3.2s) even
+      // if the page itself loads faster, so the animation isn't cut short 
+      // but never hold *less* than actual load time if the page is slower.
+      var MIN_DISPLAY_MS = reduced ? 200 : 3200;
+      var mountedAt = performance.now();
+      var loaded = false;
+      function removeSplash() {
+        var elapsed = performance.now() - mountedAt;
+        var wait = Math.max(0, MIN_DISPLAY_MS - elapsed);
+        setTimeout(function () {
+          splash.classList.add('cr-splash-hide');
+          setTimeout(function () { splash.remove(); }, 450);
+        }, wait);
+      }
+      if (document.readyState === 'complete') {
+        removeSplash();
+      } else {
+        window.addEventListener('load', removeSplash);
+      }
+    })();
+    </script>
+    
+    <nav class="border-b border-gray-800 sticky top-0 z-50 backdrop-blur-md bg-black/80">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex items-center gap-3">
+                    <a href="index.html" class="cr-logo">
+                    <div class="cr-logo-tile">
+                      <div class="cr-icon-wrap">
+                        <svg width="26" height="26" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <defs>
+                            <linearGradient id="coreGradient-nav" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#2597E8"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                            <linearGradient id="pulseGradient-nav" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#15A6DE"/><stop offset="100%" stop-color="#2597E8"/></linearGradient>
+                            <filter id="neonGlow-nav" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2" result="blur"/><feComposite in="SourceGraphic" in2="blur" operator="over"/></filter>
+                          </defs>
+                          <path class="cr-hex" d="M 32 6 L 52 18 L 52 46 L 32 58 L 12 46 L 12 18 Z" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" pathLength="1" />
+                          <path class="cr-frame" d="M 32 6 L 12 18 L 12 46 L 24 53" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+                          <path class="cr-frame b" d="M 32 58 L 52 46 L 52 18 L 40 11" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+                          <path class="cr-shard-a" d="M 32 6 L 40 11" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" />
+                          <path class="cr-shard-b" d="M 32 58 L 24 53" stroke="url(#coreGradient-nav)" stroke-width="4" stroke-linecap="round" />
+                          <path class="cr-pulse" d="M 4 36 L 24 20 L 34 46 L 60 18" stroke="url(#pulseGradient-nav)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#neonGlow-nav)" pathLength="1" />
+                        </svg>
+                      </div>
+                    </div>
+                    <div class="cr-wordmark">
+                      <span class="cr-word-core">Core</span>
+                      <span class="cr-word-ripper-wrap">
+                        <span class="cr-half top">Ripper</span>
+                        <span class="cr-half bottom">Ripper</span>
+                        <span class="cr-rip-streak"></span>
+                      </span>
+                    </div>
+                </a>
+                    <span class="text-gray-500 text-sm font-medium hidden sm:inline">/ Admin</span>
+                </div>
+                <div class="flex items-center gap-4">
+                    <a href="index.html" class="secondary-btn px-4 py-2 rounded-lg text-sm flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+                        <span class="hidden sm:inline">Back to Site</span>
+                    </a>
+                    <span id="currentUserEmail" class="text-gray-500 text-sm hidden sm:inline"></span>
+<button class="cr-appshell-menu-btn" id="crAppshellMenuBtnAdmin" aria-label="Toggle navigation menu" aria-expanded="false" onclick="(function(){var m=document.getElementById('crAppshellMobileMenuAdmin');var open=m.classList.toggle('open');this.classList.toggle('open',open);this.setAttribute('aria-expanded',open);}).call(this)"><span></span><span></span><span></span></button>
+                            <button id="logoutBtn" class="hidden text-gray-400 hover:text-[#15A6DE] transition font-medium text-sm">Log out</button>
+                </div>
+            </div>
+        </div>
+    </nav>
+<div class="cr-appshell-mobile-menu" id="crAppshellMobileMenuAdmin">
+            <a href="index.html" class="cr-appshell-mlink">Home</a>
+            <a href="dev_tools.html" class="cr-appshell-mlink">Developer Tools</a>
+            <a href="ai_tools.html" class="cr-appshell-mlink">AI Tools</a>
+            <a href="net_tools.html" class="cr-appshell-mlink">Network Tools</a>
+            <a href="blog.html" class="cr-appshell-mlink">Blog</a>
+            <a href="news.html" class="cr-appshell-mlink">News</a>
+            <a href="hardware.html" class="cr-appshell-mlink">Hardware</a>
+            <a href="pricing.html" class="cr-appshell-mlink">Pricing</a>
+        </div>
+
+    <div id="notLoggedInState" class="hidden max-w-md mx-auto px-4 py-24 text-center">
+        <div class="icon-box mx-auto mb-4"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg></div>
+        <h1 class="text-2xl font-bold mb-2">Admin access</h1>
+        <p class="text-gray-400 mb-6">Log in with an admin account to manage CoreRipper.</p>
+        <a href="login.html" class="cta-btn inline-block px-6 py-3 rounded-lg font-semibold text-white">Log In</a>
+    </div>
+
+    <div id="accessDeniedState" class="hidden max-w-md mx-auto px-4 py-24 text-center">
+        <div class="icon-box mx-auto mb-4"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg></div>
+        <h1 class="text-2xl font-bold mb-2">Not an admin account</h1>
+        <p class="text-gray-400 mb-6">This account doesn't have admin access. Contact a site owner if you believe this is wrong.</p>
+        <a href="index.html" class="secondary-btn inline-block px-6 py-3 rounded-lg font-semibold">Back to CoreRipper</a>
+    </div>
+
+    <section id="staffSection" class="hidden py-10 px-4 sm:px-6 lg:px-8">
+        <div class="max-w-5xl mx-auto">
+            <div class="flex items-center gap-3 mb-2">
+                <h1 class="text-2xl font-bold">Newsroom</h1>
+                <span class="cockpit-role-badge staff"><span class="led on" style="width:6px;height:6px;"></span>Staff Author</span>
+            </div>
+            <p class="text-gray-500 text-sm mb-8">You can write and publish blog articles. Everything else on CoreRipper is managed by a superuser.</p>
+            <div id="staffBlogHost"></div>
+        </div>
+    </section>
+
+    <section id="dashboardSection" class="hidden py-10 px-4 sm:px-6 lg:px-8">
+        <div class="max-w-7xl mx-auto">
+            <div class="flex flex-wrap items-center gap-3 mb-1">
+                <h1 class="text-2xl font-bold">Admin panel</h1>
+                <span class="cockpit-role-badge superuser"><span class="led on" style="width:6px;height:6px;"></span>Superuser</span>
+            </div>
+            <p class="text-gray-500 text-sm mb-8">Full control surface for CoreRipper  every switch here is live.</p>
+
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                <div class="border border-gray-800 rounded-xl p-5">
+                    <div class="text-3xl font-extrabold gradient-text mb-1"><span id="statUsers">0</span></div>
+                    <div class="text-gray-500 text-sm">Users</div>
+                </div>
+                <div class="border border-gray-800 rounded-xl p-5">
+                    <div class="text-3xl font-extrabold gradient-text mb-1"><span id="statTransactions">0</span></div>
+                    <div class="text-gray-500 text-sm">Transactions</div>
+                </div>
+                <div class="border border-gray-800 rounded-xl p-5">
+                    <div class="text-3xl font-extrabold gradient-text mb-1"><span id="statTools">0</span></div>
+                    <div class="text-gray-500 text-sm">Tools Tracked</div>
+                </div>
+                <div class="border border-gray-800 rounded-xl p-5">
+                    <div class="text-3xl font-extrabold gradient-text mb-1"><span id="statPosts">0</span></div>
+                    <div class="text-gray-500 text-sm">Blog Posts</div>
+                </div>
+            </div>
+
+            <div class="flex flex-wrap gap-3 mb-8">
+                <button class="tab-btn active" data-tab="overview">Overview</button>
+                <button class="tab-btn" data-tab="users">Users</button>
+                <button class="tab-btn" data-tab="transactions">Transactions</button>
+                <button class="tab-btn" data-tab="pricing">Pricing</button>
+                <button class="tab-btn" data-tab="tools">Tools</button>
+                <button class="tab-btn" data-tab="features">Feature Switches</button>
+                <button class="tab-btn" data-tab="blog">Blog Posts</button>
+                <button class="tab-btn" data-tab="news">News</button>
+                <button class="tab-btn" data-tab="hardware">Hardware</button>
+            </div>
+
+            <div class="tab-panel" data-panel="overview">
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+                    <div class="panel lg:col-span-2">
+                        <div class="panel-header">
+                            <div class="panel-title"><span class="led on" id="overallLed"></span>Systems</div>
+                            <button id="refreshSystemsBtn" class="secondary-btn text-xs px-3 py-1.5 rounded-md">Refresh</button>
+                        </div>
+                        <div class="systems-grid" id="systemsGrid"></div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header"><div class="panel-title">API Uptime</div></div>
+                        <div class="gauge-wrap">
+                            <div class="uptime-readout" id="uptimeReadout">00:00:00</div>
+                        </div>
+                        <p class="text-gray-500 text-xs mt-3">Since the backend process last restarted.</p>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="panel-title"><span class="led on blink" style="width:6px;height:6px;"></span>Live Activity</div>
+                        <button id="refreshActivityBtn" class="secondary-btn text-xs px-3 py-1.5 rounded-md">Refresh</button>
+                    </div>
+                    <div class="activity-feed" id="activityFeed"></div>
+                    <div id="activityEmpty" class="hidden text-center py-10 text-gray-500 text-sm">No activity recorded yet.</div>
+                </div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="users">
+                <div class="overflow-x-auto border border-gray-800 rounded-xl">
+                    <table>
+                        <thead><tr>
+                            <th>Email</th><th>Joined</th><th>Plan</th><th>Active</th><th>Expires</th><th>Last login</th><th>Role</th><th>Actions</th>
+                        </tr></thead>
+                        <tbody id="usersTableBody"></tbody>
+                    </table>
+                </div>
+                <div id="usersEmpty" class="hidden text-center py-12 text-gray-500">No users yet.</div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="transactions">
+                <div class="overflow-x-auto border border-gray-800 rounded-xl">
+                    <table>
+                        <thead><tr>
+                            <th>User</th><th>Amount</th><th>Provider</th><th>Status</th><th>Reference</th><th>Date</th>
+                        </tr></thead>
+                        <tbody id="transactionsTableBody"></tbody>
+                    </table>
+                </div>
+                <div id="transactionsEmpty" class="hidden text-center py-12 text-gray-500">No transactions yet.</div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="pricing">
+                <div class="flex items-center justify-between mb-5 gap-4 flex-wrap">
+                    <p class="text-gray-500 text-sm">Premium price options. Only <span class="text-gray-300 font-semibold">active</span> options appear on the public pricing page and can be purchased  prices show in USD but are charged in ZMW via Lenco. Changes reflect everywhere immediately.</p>
+                    <button id="addPriceBtn" class="secondary-btn text-xs px-3 py-1.5 rounded-md whitespace-nowrap">+ Add price option</button>
+                </div>
+                <div id="priceForm" class="hidden border border-gray-800 rounded-xl p-5 mb-5">
+                    <div class="text-sm font-bold mb-4" id="priceFormTitle">New price option</div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-2">
+                        <div>
+                            <label class="text-xs text-gray-500 block mb-1">Label</label>
+                            <input type="text" class="field-input w-full" id="pfLabel" placeholder="Premium Monthly" maxlength="80">
+                        </div>
+                        <div>
+                            <label class="text-xs text-gray-500 block mb-1">Price (USD)</label>
+                            <input type="number" step="0.01" min="0.01" class="field-input w-full" id="pfUsd" placeholder="12.00">
+                        </div>
+                        <div>
+                            <label class="text-xs text-gray-500 block mb-1">Period (days)</label>
+                            <input type="number" min="1" max="3650" class="field-input w-full" id="pfDays" placeholder="30" value="30">
+                        </div>
+                        <div>
+                            <label class="text-xs text-gray-500 block mb-1">Sort order</label>
+                            <input type="number" min="0" max="999" class="field-input w-full" id="pfSort" placeholder="0" value="0">
+                        </div>
+                    </div>
+                    <p class="text-gray-500 text-xs mb-4" id="pfZmwPreview">Zambian customers are charged the Kwacha equivalent at the real-time USD→ZMW market rate; international cards are charged in USD.</p>
+                    <div class="flex gap-2">
+                        <button id="savePriceBtn" class="cta-btn text-xs px-4 py-2 rounded-md font-semibold text-white">Save</button>
+                        <button id="cancelPriceBtn" class="secondary-btn text-xs px-4 py-2 rounded-md">Cancel</button>
+                    </div>
+                </div>
+                <div id="pricesList" class="space-y-3"></div>
+                <div id="pricesEmpty" class="hidden text-center py-12 text-gray-500">No price options yet  add one above.</div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="tools">
+                <div id="toolsGroups" class="space-y-8"></div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="features">
+                <p class="text-gray-500 text-sm mb-5">Kill switches for live CoreRipper features. Flipping one off returns a 503 to every non-superuser request under that feature immediately  you always stay bypassed so you can test with it off.</p>
+                <div id="featuresList" class="space-y-3"></div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="blog">
+                <div id="superuserBlogHost"></div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="news">
+                <div class="flex items-center justify-between mb-6">
+                    <p class="text-gray-500 text-sm">Review AI-drafted news items before they go live. Nothing here is public until approved.</p>
+                    <div class="flex gap-2" id="newsStatusFilter">
+                        <button class="news-filter-btn active" data-news-status="pending">Pending</button>
+                        <button class="news-filter-btn" data-news-status="published">Published</button>
+                        <button class="news-filter-btn" data-news-status="rejected">Rejected</button>
+                    </div>
+                </div>
+                <div id="newsList" class="space-y-3"></div>
+                <div id="newsEmpty" class="hidden text-center py-12 text-gray-500">No drafts in this status.</div>
+            </div>
+
+            <div class="tab-panel hidden" data-panel="hardware">
+                <div class="flex items-center justify-between mb-6">
+                    <p class="text-gray-500 text-sm">Review hardware/gaming stories pulled from the wired RSS sources before they go live. Nothing here is public until approved.</p>
+                    <div class="flex gap-2" id="hardwareStatusFilter">
+                        <button class="hw-filter-btn active" data-hw-status="pending">Pending</button>
+                        <button class="hw-filter-btn" data-hw-status="published">Published</button>
+                        <button class="hw-filter-btn" data-hw-status="rejected">Rejected</button>
+                    </div>
+                </div>
+                <div id="hardwareList" class="space-y-3"></div>
+                <div id="hardwareEmpty" class="hidden text-center py-12 text-gray-500">No items in this status.</div>
+            </div>
+
+        </div>
+    </section>
+
+    <template id="blogPanelTemplate">
+        <div id="blogListView">
+            <div class="flex items-center justify-between mb-6">
+                <p class="text-gray-500 text-sm">Manage every article on the blog, published or draft.</p>
+                <button id="newPostBtn" class="cta-btn px-5 py-2.5 rounded-lg font-semibold text-white text-sm">+ New Post</button>
+            </div>
+            <div id="postList" class="space-y-3"></div>
+            <div id="postsEmpty" class="hidden text-center py-12 text-gray-500">No posts yet  create the first one.</div>
+        </div>
+
+        <div id="blogEditView" class="hidden">
+            <button id="backToListBtn" class="text-gray-400 hover:text-[#15A6DE] transition flex items-center gap-2 mb-6 text-sm">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                Back to posts
+            </button>
+            <h2 id="editTitle" class="text-xl font-bold mb-6">New Post</h2>
+            <div id="editError" class="error-banner mb-4 hidden"></div>
+
+            <form id="postForm" class="space-y-5" onsubmit="return false;">
+                <input type="hidden" id="postId">
+                <div>
+                    <label class="field-label">Title</label>
+                    <input type="text" id="fieldTitle" class="field-input" required>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="field-label">Slug (leave blank to auto-generate)</label>
+                        <input type="text" id="fieldSlug" class="field-input">
+                    </div>
+                    <div>
+                        <label class="field-label">Category</label>
+                        <select id="fieldCategory" class="field-select"></select>
+                    </div>
+                </div>
+                <div>
+                    <label class="field-label">Excerpt (shown on cards, max 300 chars)</label>
+                    <textarea id="fieldExcerpt" class="field-input" rows="2" maxlength="300" required></textarea>
+                </div>
+                <div>
+                    <label class="field-label">Cover image URL (optional  falls back to a category icon if blank)</label>
+                    <div class="article-thumb-row">
+                        <img id="coverImagePreview" class="article-thumb hidden" alt="">
+                        <div class="flex-1 min-w-0">
+                            <input type="url" id="fieldCoverImageUrl" class="field-input" placeholder="https://example.com/image.jpg">
+                            <button type="button" id="coverImageChooseBtn" class="secondary-btn text-xs px-3 py-1.5 rounded-md mt-2">Choose picture</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="field-label">Author name</label>
+                        <input type="text" id="fieldAuthorName" class="field-input" value="CoreRipper Team">
+                    </div>
+                    <div>
+                        <label class="field-label">Author initials</label>
+                        <input type="text" id="fieldAuthorInitials" class="field-input" value="CL" maxlength="4">
+                    </div>
+                </div>
+                <div>
+                    <div class="flex items-center justify-between mb-2">
+                        <label class="field-label mb-0">Content (Markdown + HTML formatting tags)</label>
+                        <button type="button" id="togglePreviewBtn" class="secondary-btn text-xs px-3 py-1.5 rounded-md">Show preview</button>
+                    </div>
+                    <div class="editor-toolbar" id="editorToolbar">
+                        <button type="button" id="undoBtn" title="Undo (Ctrl+Z)">↶ Undo</button>
+                        <button type="button" id="redoBtn" title="Redo (Ctrl+Y)">↷ Redo</button>
+                        <span class="editor-toolbar-sep"></span>
+                        <button type="button" data-md-wrap="**|**" title="Bold"><strong>B</strong></button>
+                        <button type="button" data-md-wrap="*|*" title="Italic"><em>I</em></button>
+                        <button type="button" data-md-wrap="&lt;u&gt;|&lt;/u&gt;" title="Underline"><u>U</u></button>
+                        <button type="button" data-md-wrap="~~|~~" title="Strikethrough"><s>S</s></button>
+                        <button type="button" data-md-wrap="&lt;mark&gt;|&lt;/mark&gt;" title="Highlight"><span style="background:rgba(251,191,36,0.35);border-radius:3px;padding:0 3px;">H</span></button>
+                        <span class="editor-toolbar-sep"></span>
+                        <button type="button" data-md-line="## " title="Heading">H2</button>
+                        <button type="button" data-md-line="### " title="Subheading">H3</button>
+                        <button type="button" data-md-line="- " title="Bullet list">• List</button>
+                        <button type="button" data-md-line="&gt; " title="Quote">❝ Quote</button>
+                        <span class="editor-toolbar-sep"></span>
+                        <button type="button" data-md-wrap="`|`" title="Inline code">&lt;/&gt;</button>
+                        <button type="button" data-md-wrap="&lt;kbd&gt;|&lt;/kbd&gt;" title="Keyboard key">⌘ Kbd</button>
+                        <button type="button" data-md-wrap="&lt;sup&gt;|&lt;/sup&gt;" title="Superscript">x²</button>
+                        <button type="button" data-md-wrap="&lt;sub&gt;|&lt;/sub&gt;" title="Subscript">x₂</button>
+                        <span class="editor-toolbar-sep"></span>
+                        <button type="button" id="insertLinkBtn" title="Insert link"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px"><path d="M10 13a5 5 0 0 0 7.07 0l1.93-1.93a5 5 0 0 0-7.07-7.07L10.5 5.5"/><path d="M14 11a5 5 0 0 0-7.07 0L5 12.93a5 5 0 0 0 7.07 7.07L13.5 18.5"/></svg> Link</button>
+                        <button type="button" id="insertImageBtn" title="Upload and insert an image"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg> Image</button>
+                    </div>
+                    <textarea id="fieldContent" class="code-area" rows="16" required></textarea>
+                    <p class="text-gray-600 text-xs mt-1.5">Markdown plus HTML emphasis tags (&lt;u&gt;, &lt;mark&gt;, &lt;kbd&gt;, &lt;sup&gt;, &lt;sub&gt;, &lt;abbr&gt;…) are supported. Images: click <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg> Image to upload one from your device.</p>
+                    <div id="previewPane" class="hidden mt-4 p-5 border border-gray-800 rounded-xl prose"></div>
+                </div>
+                <div class="flex items-center gap-3">
+                    <input type="checkbox" id="fieldPublished" class="w-4 h-4">
+                    <label for="fieldPublished" class="text-sm">Published (visible on the public blog)</label>
+                </div>
+                <div class="flex items-center gap-3 pt-2">
+                    <button type="submit" id="saveBtn" class="cta-btn px-6 py-2.5 rounded-lg font-semibold text-white text-sm">Save</button>
+                    <button type="button" id="deleteBtn" class="danger-btn hidden px-6 py-2.5 rounded-lg font-semibold text-sm">Delete</button>
+                </div>
+            </form>
+            
+            <input type="file" id="imageUploadInput" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,.svg" style="display:none;">
+        </div>
+    </template>
+
+    <div id="dangerOverlay" class="danger-overlay hidden">
+        <div class="danger-modal">
+            <h2>
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3.75m0 3.75h.008v.008H12v-.008zM21.75 12a9.75 9.75 0 11-19.5 0 9.75 9.75 0 0119.5 0z"></path></svg>
+                Delete account  irreversible
+            </h2>
+            <div class="stripe"></div>
+            <p class="text-sm text-gray-300 mb-1">You are about to permanently delete:</p>
+            <p class="font-bold text-lg mb-4" id="dangerTargetEmail"></p>
+            <p class="text-xs text-gray-500 mb-5">Every project, saved result, monitor, ticket, and payment record owned by this account will be deleted from the database. This cannot be undone.</p>
+            <button id="dangerConfirmBtn" class="danger-confirm-btn" disabled><span id="dangerBtnLabel">Arming…</span> <span id="dangerCountdown">5</span></button>
+            <button id="dangerCancelBtn" class="secondary-btn w-full py-2.5 rounded-lg text-sm mt-3">Cancel</button>
+        </div>
+    </div>
+
+    <div id="imagePickerOverlay" class="image-picker-overlay hidden">
+        <div class="image-picker-modal">
+            <h3>Choose a picture</h3>
+            <div id="imagePickerGrid" class="image-picker-grid"></div>
+            <div class="image-picker-upload-row">
+                <button type="button" id="imagePickerUploadBtn" class="secondary-btn text-xs px-3 py-1.5 rounded-md">Upload your own</button>
+                <input type="file" id="imagePickerUploadInput" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,.svg" style="display:none;">
+                <button type="button" id="imagePickerCancelBtn" class="secondary-btn text-xs px-3 py-1.5 rounded-md ml-auto">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="success-toast">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+        <span id="toastMessage">Saved</span>
+    </div>
+
+    <script>
+        const API_BASE = window.CR_API_BASE;
+        let token = localStorage.getItem('coreripperToken');
+        let categories = [];
+        let posts = [];
+        let currentUsers = [];
+        let currentMe = null;
+
+        function authHeaders() {
+            return { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+        }
+
+        const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        function animateCounter(elId, target) {
+            const el = document.getElementById(elId);
+            if (!el) return;
+            if (reduceMotion) {
+                el.textContent = target;
+                return;
+            }
+            const duration = 900;
+            const start = performance.now();
+            function tick(now) {
+                const progress = Math.min((now - start) / duration, 1);
+                const eased = 1 - Math.pow(1 - progress, 3);
+                el.textContent = Math.round(target * eased);
+                if (progress < 1) requestAnimationFrame(tick);
+            }
+            requestAnimationFrame(tick);
+        }
+
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            document.getElementById('toastMessage').textContent = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 2200);
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str == null ? '' : str;
+            return div.innerHTML;
+        }
+
+        function formatDate(iso) {
+            if (!iso) return '';
+            return new Date(iso).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+        }
+
+        function formatDateTime(iso) {
+            if (!iso) return '';
+            return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function formatUptime(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${pad(h)}:${pad(m)}:${pad(s)}`;
+        }
+
+        function logout() {
+            window.CoreRipperAuth.logout();
+            window.location.href = 'index.html';
+        }
+
+        // --------------------------------------------------- image picker
+        // Shared "Change picture" modal: shows the real Commons pool for a
+        // given (app, category) plus an upload option, and hands the chosen
+        // image back to whichever caller opened it (news card, hardware
+        // card, or the blog editor's cover-image field). Each caller decides
+        // what to do with the result  news/hardware PATCH their own image
+        // endpoint, blog just writes the URL into its existing text field.
+
+        let imagePickerOnSelect = null;
+        let imagePickerPool = [];
+
+        function closeImagePicker() {
+            document.getElementById('imagePickerOverlay').classList.add('hidden');
+            imagePickerOnSelect = null;
+            imagePickerPool = [];
+        }
+
+        async function openImagePicker(app, category, onSelect) {
+            imagePickerOnSelect = onSelect;
+            imagePickerPool = [];
+            const grid = document.getElementById('imagePickerGrid');
+            grid.innerHTML = '<div class="image-picker-grid-empty">Loading pool photos…</div>';
+            document.getElementById('imagePickerOverlay').classList.remove('hidden');
+            try {
+                const res = await fetch(`${API_BASE}/api/core/admin/category-images/?app=${encodeURIComponent(app)}&category=${encodeURIComponent(category)}`, { headers: authHeaders() });
+                if (res.status === 401) return logout();
+                const data = await res.json().catch(() => ({}));
+                imagePickerPool = data.images || [];
+                grid.innerHTML = imagePickerPool.length
+                    ? imagePickerPool.map((img, idx) => `
+                        <button type="button" class="image-picker-thumb-btn" data-picker-index="${idx}">
+                            <img src="${escapeHtml(img.thumb_url)}" loading="lazy" alt="">
+                        </button>`).join('')
+                    : '<div class="image-picker-grid-empty">No pool photos for this category yet  upload one below instead.</div>';
+            } catch (err) {
+                grid.innerHTML = '<div class="image-picker-grid-empty">Could not load the pool  upload one below instead.</div>';
+            }
+        }
+
+        document.getElementById('imagePickerGrid').addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-picker-index]');
+            if (!btn) return;
+            const img = imagePickerPool[Number(btn.dataset.pickerIndex)];
+            if (!img) return;
+            const select = imagePickerOnSelect;
+            closeImagePicker();
+            if (select) select({
+                image_url: img.image_url,
+                thumb_url: img.thumb_url,
+                credit_name: img.credit_name || '',
+                credit_url: img.credit_url || '',
+                license_name: img.license_name || '',
+                source_name: img.credit_name || 'Wikimedia Commons',
+                provider: 'manual_pool',
+            });
+        });
+
+        document.getElementById('imagePickerCancelBtn').addEventListener('click', closeImagePicker);
+        document.getElementById('imagePickerOverlay').addEventListener('click', (e) => {
+            if (e.target.id === 'imagePickerOverlay') closeImagePicker();
+        });
+
+        document.getElementById('imagePickerUploadBtn').addEventListener('click', () => {
+            document.getElementById('imagePickerUploadInput').click();
+        });
+
+        document.getElementById('imagePickerUploadInput').addEventListener('change', async () => {
+            const input = document.getElementById('imagePickerUploadInput');
+            const file = input.files[0];
+            input.value = '';
+            if (!file) return;
+            const uploadBtn = document.getElementById('imagePickerUploadBtn');
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = 'Uploading…';
+            try {
+                const formData = new FormData();
+                formData.append('image', file);
+                const res = await fetch(`${API_BASE}/api/blog/admin/upload-image/`, {
+                    method: 'POST',
+                    headers: { Authorization: `Bearer ${token}` }, // no Content-Type: browser sets the multipart boundary
+                    body: formData,
+                });
+                if (res.status === 401) return logout();
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.message || 'Upload failed.');
+                const select = imagePickerOnSelect;
+                closeImagePicker();
+                if (select) select({
+                    image_url: data.url, thumb_url: data.url,
+                    credit_name: '', credit_url: '', license_name: '',
+                    source_name: 'Manual upload', provider: 'manual_upload',
+                });
+            } catch (err) {
+                showToast(err.message);
+            } finally {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = 'Upload your own';
+            }
+        });
+
+        // ---------------------------------------------------------- gating
+
+        async function init() {
+            if (!token) {
+                document.getElementById('notLoggedInState').classList.remove('hidden');
+                return;
+            }
+            try {
+                const res = await fetch(`${API_BASE}/api/accounts/me/`, { headers: authHeaders() });
+                if (res.status === 401) return logout();
+                const me = await res.json();
+                currentMe = me;
+                if (!me.is_admin) {
+                    document.getElementById('accessDeniedState').classList.remove('hidden');
+                    return;
+                }
+                document.getElementById('currentUserEmail').textContent = me.email;
+                document.getElementById('currentUserEmail').classList.remove('hidden');
+                document.getElementById('logoutBtn').classList.remove('hidden');
+
+                if (me.is_superuser) {
+                    document.getElementById('dashboardSection').classList.remove('hidden');
+                    mountBlogPanel(document.getElementById('superuserBlogHost'));
+                    await Promise.all([
+                        loadUsers(), loadTransactions(), loadPrices(), loadTools(), loadCategories(), loadPosts(),
+                        loadSystems(), loadActivity(), loadFeatures(), loadNews(), loadHardware(),
+                    ]);
+                    startUptimeClock();
+                } else {
+                    // Staff (not superuser): blog authoring only.
+                    document.getElementById('staffSection').classList.remove('hidden');
+                    mountBlogPanel(document.getElementById('staffBlogHost'));
+                    await Promise.all([loadCategories(), loadPosts()]);
+                }
+            } catch (err) {
+                document.getElementById('notLoggedInState').classList.remove('hidden');
+            }
+        }
+
+        // ------------------------------------------------------------ tabs
+
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                const tab = btn.dataset.tab;
+                document.querySelectorAll('#dashboardSection .tab-panel').forEach(p => p.classList.toggle('hidden', p.dataset.panel !== tab));
+            });
+        });
+
+        // ------------------------------------------------------- overview
+
+        const SYSTEM_LABELS = {
+            api: 'API Server', database: 'Database', redis: 'Redis / Broker',
+            worker: 'Celery Worker', email: 'Outgoing Email', google_auth: 'Google Sign-In',
+        };
+
+        let uptimeBase = 0;
+        let uptimeStartedAt = 0;
+        let uptimeTimer = null;
+
+        function startUptimeClock() {
+            if (uptimeTimer) clearInterval(uptimeTimer);
+            uptimeStartedAt = performance.now();
+            uptimeTimer = setInterval(() => {
+                const elapsed = Math.floor((performance.now() - uptimeStartedAt) / 1000);
+                document.getElementById('uptimeReadout').textContent = formatUptime(uptimeBase + elapsed);
+            }, 1000);
+        }
+
+        async function loadSystems() {
+            const res = await fetch(`${API_BASE}/api/admin/systems/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            if (!res.ok) return;
+            const data = await res.json();
+            uptimeBase = data.api_uptime_seconds || 0;
+            document.getElementById('uptimeReadout').textContent = formatUptime(uptimeBase);
+
+            const grid = document.getElementById('systemsGrid');
+            const keys = Object.keys(SYSTEM_LABELS);
+            let allUp = true;
+            grid.innerHTML = keys.map(key => {
+                const up = !!data.systems[key];
+                if (!up) allUp = false;
+                return `
+                <div class="system-cell">
+                    <div>
+                        <div class="label">${SYSTEM_LABELS[key]}</div>
+                        <div class="value">${up ? 'ONLINE' : 'OFFLINE'}</div>
+                    </div>
+                    <span class="led ${up ? 'on' : 'off'}"></span>
+                </div>`;
+            }).join('');
+            document.getElementById('overallLed').className = `led ${allUp ? 'on' : 'warn'}`;
+        }
+
+        async function loadActivity() {
+            const res = await fetch(`${API_BASE}/api/admin/activity/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            if (!res.ok) return;
+            const data = await res.json();
+            const feed = document.getElementById('activityFeed');
+            document.getElementById('activityEmpty').classList.toggle('hidden', data.events.length > 0);
+            feed.innerHTML = data.events.map((e, i) => `
+                <div class="activity-row" style="animation-delay:${Math.min(i * 25, 400)}ms;">
+                    <span class="activity-dot ${e.kind}"></span>
+                    <span class="activity-ts">${formatDateTime(e.ts)}</span>
+                    <span class="activity-text">${escapeHtml(e.text)}</span>
+                </div>
+            `).join('');
+        }
+
+        document.getElementById('refreshSystemsBtn').addEventListener('click', loadSystems);
+        document.getElementById('refreshActivityBtn').addEventListener('click', loadActivity);
+
+        // ---------------------------------------------------- feature flags
+
+        async function loadFeatures() {
+            const res = await fetch(`${API_BASE}/api/admin/features/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            if (!res.ok) return;
+            const data = await res.json();
+            const list = document.getElementById('featuresList');
+            list.innerHTML = data.features.map(f => `
+                <div class="feature-row ${f.enabled ? '' : 'disabled'}" data-feature-key="${f.key}">
+                    <div>
+                        <div class="name">${escapeHtml(f.label)}</div>
+                        <div class="desc">${escapeHtml(f.description)}</div>
+                    </div>
+                    <label class="cockpit-switch">
+                        <input type="checkbox" class="feature-toggle" ${f.enabled ? 'checked' : ''}>
+                        <span class="track"></span>
+                    </label>
+                </div>
+            `).join('');
+        }
+
+        document.getElementById('featuresList').addEventListener('change', async (e) => {
+            if (!e.target.classList.contains('feature-toggle')) return;
+            const row = e.target.closest('[data-feature-key]');
+            const key = row.dataset.featureKey;
+            const enabled = e.target.checked;
+            e.target.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/api/admin/features/${key}/`, {
+                    method: 'PATCH', headers: authHeaders(), body: JSON.stringify({ enabled }),
+                });
+                if (res.status === 401) return logout();
+                if (!res.ok) throw new Error('toggle failed');
+                row.classList.toggle('disabled', !enabled);
+                showToast(`${row.querySelector('.name').textContent} ${enabled ? 'switched ON' : 'switched OFF'}`);
+                loadActivity();
+            } catch (err) {
+                e.target.checked = !enabled; // revert on failure
+                showToast('Could not update that switch  try again.');
+            } finally {
+                e.target.disabled = false;
+            }
+        });
+
+        // ---------------------------------------------------------- pricing
+
+        let currentPrices = [];
+        let currentFx = null; // {usd_to_zmw, source, fetched_at} from the backend rate service
+        let editingPriceId = null;
+
+        const PRICE_PERIODS = { 30: 'monthly', 365: 'yearly' };
+
+        function fxRateLabel() {
+            if (!currentFx) return '';
+            const rate = parseFloat(currentFx.usd_to_zmw);
+            const when = currentFx.source === 'live' ? "today's market rate"
+                : currentFx.source === 'stored' ? 'last fetched market rate'
+                : 'fallback rate (no live feed reachable)';
+            return `1 USD = K${rate}  ${when}`;
+        }
+
+        function updateZmwPreview() {
+            const usd = parseFloat(document.getElementById('pfUsd').value);
+            const el = document.getElementById('pfZmwPreview');
+            if (currentFx && usd > 0) {
+                const zmw = (usd * parseFloat(currentFx.usd_to_zmw)).toFixed(2);
+                el.textContent = `Zambian customers pay ≈ K${zmw} ZMW (${fxRateLabel()}); international cards pay $${usd} USD.`;
+            } else {
+                el.textContent = 'Zambian customers are charged the Kwacha equivalent at the real-time USD→ZMW market rate; international cards are charged in USD.';
+            }
+        }
+
+        async function loadPrices() {
+            const res = await fetch(`${API_BASE}/api/payments/admin/prices/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            if (!res.ok) return;
+            const data = await res.json();
+            currentPrices = data.prices;
+            currentFx = data.fx || null;
+            const list = document.getElementById('pricesList');
+            document.getElementById('pricesEmpty').classList.toggle('hidden', data.prices.length > 0);
+            list.innerHTML = data.prices.map(p => `
+                <div class="feature-row ${p.is_active ? '' : 'disabled'}" data-price-id="${p.id}">
+                    <div>
+                        <div class="name">${escapeHtml(p.label)}
+                            <span class="text-gray-500 font-normal text-xs">· ${PRICE_PERIODS[p.period_days] || p.period_days + ' days'}</span>
+                            ${p.is_active ? '<span class="badge status-paid" style="margin-left:6px;">live</span>' : '<span class="badge" style="margin-left:6px;background:rgba(107,114,128,0.15);color:#9ca3af;border:1px solid rgba(107,114,128,0.35);">hidden</span>'}
+                        </div>
+                        <div class="desc">Shows as <span class="text-gray-300 font-semibold">$${parseFloat(p.display_amount_usd)}</span>  Zambians pay ≈ <span class="text-gray-300 font-semibold">K${parseFloat(p.amount_zmw)} ZMW</span> (${fxRateLabel()})</div>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <button class="secondary-btn text-xs px-3 py-1.5 rounded-md edit-price-btn">Edit</button>
+                        <button class="danger-btn text-xs px-3 py-1.5 rounded-md delete-price-btn">Delete</button>
+                        <label class="cockpit-switch" title="Active: shown on the pricing page and purchasable">
+                            <input type="checkbox" class="price-active-toggle" ${p.is_active ? 'checked' : ''}>
+                            <span class="track"></span>
+                        </label>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function openPriceForm(price) {
+            editingPriceId = price ? price.id : null;
+            document.getElementById('priceFormTitle').textContent = price ? `Edit  ${price.label}` : 'New price option';
+            document.getElementById('pfLabel').value = price ? price.label : '';
+            document.getElementById('pfUsd').value = price ? price.display_amount_usd : '';
+            document.getElementById('pfDays').value = price ? price.period_days : 30;
+            document.getElementById('pfSort').value = price ? price.sort_order : 0;
+            updateZmwPreview();
+            document.getElementById('priceForm').classList.remove('hidden');
+            document.getElementById('pfLabel').focus();
+        }
+
+        document.getElementById('pfUsd').addEventListener('input', updateZmwPreview);
+
+        function closePriceForm() {
+            editingPriceId = null;
+            document.getElementById('priceForm').classList.add('hidden');
+        }
+
+        document.getElementById('addPriceBtn').addEventListener('click', () => openPriceForm(null));
+        document.getElementById('cancelPriceBtn').addEventListener('click', closePriceForm);
+
+        document.getElementById('savePriceBtn').addEventListener('click', async () => {
+            const body = {
+                label: document.getElementById('pfLabel').value.trim(),
+                display_amount_usd: document.getElementById('pfUsd').value,
+                period_days: parseInt(document.getElementById('pfDays').value, 10),
+                sort_order: parseInt(document.getElementById('pfSort').value, 10) || 0,
+            };
+            if (!body.label) { showToast('Enter a label.'); return; }
+            if (!(parseFloat(body.display_amount_usd) > 0)) { showToast('The USD price must be greater than 0.'); return; }
+            if (!(body.period_days >= 1 && body.period_days <= 3650)) { showToast('Period must be 1–3650 days.'); return; }
+            const btn = document.getElementById('savePriceBtn');
+            btn.disabled = true;
+            try {
+                const url = editingPriceId ? `${API_BASE}/api/payments/admin/prices/${editingPriceId}/` : `${API_BASE}/api/payments/admin/prices/`;
+                const res = await fetch(url, {
+                    method: editingPriceId ? 'PATCH' : 'POST', headers: authHeaders(), body: JSON.stringify(body),
+                });
+                if (res.status === 401) return logout();
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.message || 'Save failed.');
+                showToast(editingPriceId ? 'Price option updated.' : 'Price option created  flip it live when ready.');
+                closePriceForm();
+                await loadPrices();
+            } catch (err) {
+                showToast(err.message);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('pricesList').addEventListener('change', async (e) => {
+            if (!e.target.classList.contains('price-active-toggle')) return;
+            const row = e.target.closest('[data-price-id]');
+            const priceId = row.dataset.priceId;
+            const isActive = e.target.checked;
+            e.target.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/api/payments/admin/prices/${priceId}/`, {
+                    method: 'PATCH', headers: authHeaders(), body: JSON.stringify({ is_active: isActive }),
+                });
+                if (res.status === 401) return logout();
+                if (!res.ok) throw new Error('toggle failed');
+                row.classList.toggle('disabled', !isActive);
+                showToast(isActive ? 'Price is now live on the pricing page.' : 'Price hidden from the pricing page.');
+            } catch (err) {
+                e.target.checked = !isActive; // revert on failure
+                showToast('Could not update that price  try again.');
+            } finally {
+                e.target.disabled = false;
+            }
+        });
+
+        document.getElementById('pricesList').addEventListener('click', async (e) => {
+            const row = e.target.closest('[data-price-id]');
+            if (!row) return;
+            const price = currentPrices.find(p => String(p.id) === String(row.dataset.priceId));
+            if (e.target.closest('.edit-price-btn')) { openPriceForm(price); return; }
+            if (e.target.closest('.delete-price-btn')) {
+                if (!confirm(`Delete "${price.label}"? Past payments keep their records, but deactivating is usually the better choice.`)) return;
+                try {
+                    const res = await fetch(`${API_BASE}/api/payments/admin/prices/${price.id}/`, { method: 'DELETE', headers: authHeaders() });
+                    if (res.status === 401) return logout();
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(data.message || 'Delete failed.');
+                    showToast(data.message || 'Deleted.');
+                    await loadPrices();
+                } catch (err) {
+                    showToast(err.message);
+                }
+            }
+        });
+
+        // ------------------------------------------------------------- news
+
+        let allNewsItems = [];
+        let currentNewsStatus = 'pending';
+
+        async function loadNews() {
+            const res = await fetch(`${API_BASE}/api/news/admin/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            if (!res.ok) return;
+            const data = await res.json();
+            allNewsItems = data.items;
+            renderNews();
+        }
+
+        // Shared by news + hardware cards: shows the resolved article image
+        // (the same one core.intel.resolved_article_image serves publicly)
+        // with credit + a "Change picture" button, or an honest "no image"
+        // placeholder  never a fabricated photo.
+        function renderArticleThumb(image, changeBtnClass) {
+            return `
+                <div class="article-thumb-row">
+                    ${image
+                        ? `<img class="article-thumb" src="${escapeHtml(image.thumb_url || image.image_url)}" alt="">`
+                        : `<div class="article-thumb-none">No image</div>`}
+                    <div class="article-thumb-meta">
+                        ${image && (image.credit_name || image.source_name) ? `Credit: ${escapeHtml(image.credit_name || image.source_name)}<br>` : ''}
+                        <button type="button" class="secondary-btn text-xs px-2 py-1 rounded-md mt-1 ${changeBtnClass}">Change picture</button>
+                    </div>
+                </div>`;
+        }
+
+        function renderNews() {
+            const items = allNewsItems.filter(i => i.status === currentNewsStatus);
+            const list = document.getElementById('newsList');
+            document.getElementById('newsEmpty').classList.toggle('hidden', items.length > 0);
+            list.innerHTML = items.map(i => `
+                <div class="news-item" data-news-id="${i.id}" data-news-category="${escapeHtml(i.category)}">
+                    <div class="title">${escapeHtml(i.title)}</div>
+                    <div class="meta">${escapeHtml(i.category_display)} &middot; ${escapeHtml(i.source_name)} &middot; score ${i.trending_score.toFixed(1)} &middot; ${formatDateTime(i.created_at)}${i.updates && i.updates.length > 1 ? ` &middot; ${i.updates.length - 1} update(s) logged` : ''}</div>
+                    <div class="summary">${escapeHtml(i.ai_summary)}</div>
+                    ${renderArticleThumb(i.image, 'news-change-picture-btn')}
+                    <div class="flex gap-2 flex-wrap">
+                        <a href="${i.source_url}" target="_blank" rel="noopener" class="secondary-btn text-xs px-3 py-1.5 rounded-md">Source</a>
+                        ${i.status !== 'published' ? `<button class="cta-btn text-xs px-3 py-1.5 rounded-md text-white news-approve-btn">Approve &amp; Publish</button>` : ''}
+                        ${i.status !== 'rejected' ? `<button class="secondary-btn text-xs px-3 py-1.5 rounded-md news-reject-btn">Reject</button>` : ''}
+                        ${i.status === 'published' ? `<button class="secondary-btn text-xs px-3 py-1.5 rounded-md news-log-update-btn">+ Log Update</button>` : ''}
+                    </div>
+                    ${i.status === 'published' ? `
+                    <div class="news-update-form hidden" style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid #1f2937;">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mb-2">
+                            <select class="field-select news-update-kind text-xs">
+                                <option value="update">Content Update</option>
+                                <option value="advisory">Advisory / Release Note</option>
+                                <option value="correction">Correction</option>
+                            </select>
+                            <input type="text" class="field-input news-update-title text-xs md:col-span-2" placeholder="What changed (e.g. 'CVE now has a patch')">
+                        </div>
+                        <textarea class="field-input news-update-desc text-xs w-full mb-2" rows="2" placeholder="Details (optional)"></textarea>
+                        <button class="cta-btn text-xs px-3 py-1.5 rounded-md text-white news-submit-update-btn">Save Update</button>
+                    </div>` : ''}
+                </div>
+            `).join('');
+        }
+
+        document.getElementById('newsStatusFilter').addEventListener('click', (e) => {
+            const btn = e.target.closest('.news-filter-btn');
+            if (!btn) return;
+            document.querySelectorAll('.news-filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentNewsStatus = btn.dataset.newsStatus;
+            renderNews();
+        });
+
+        document.getElementById('newsList').addEventListener('click', async (e) => {
+            const row = e.target.closest('[data-news-id]');
+            if (!row) return;
+            const id = row.dataset.newsId;
+
+            if (e.target.classList.contains('news-change-picture-btn')) {
+                openImagePicker('news', row.dataset.newsCategory, async (chosen) => {
+                    try {
+                        const res = await fetch(`${API_BASE}/api/news/admin/${id}/image/`, {
+                            method: 'PATCH', headers: authHeaders(), body: JSON.stringify(chosen),
+                        });
+                        if (res.status === 401) return logout();
+                        if (!res.ok) throw new Error('image update failed');
+                        const updated = await res.json();
+                        const idx = allNewsItems.findIndex(i => i.id === updated.id);
+                        if (idx !== -1) allNewsItems[idx] = updated;
+                        renderNews();
+                        showToast('Picture updated.');
+                    } catch (err) {
+                        showToast('Could not update the picture  try again.');
+                    }
+                });
+                return;
+            }
+
+            if (e.target.classList.contains('news-log-update-btn')) {
+                row.querySelector('.news-update-form').classList.toggle('hidden');
+                return;
+            }
+
+            if (e.target.classList.contains('news-submit-update-btn')) {
+                const form = row.querySelector('.news-update-form');
+                const kind = form.querySelector('.news-update-kind').value;
+                const title = form.querySelector('.news-update-title').value.trim();
+                const description = form.querySelector('.news-update-desc').value.trim();
+                if (!title) { showToast('Give the update a short title first.'); return; }
+                e.target.disabled = true;
+                try {
+                    const res = await fetch(`${API_BASE}/api/news/admin/${id}/updates/`, {
+                        method: 'POST', headers: authHeaders(), body: JSON.stringify({ kind, title, description }),
+                    });
+                    if (res.status === 401) return logout();
+                    if (!res.ok) throw new Error('log failed');
+                    const updated = await res.json();
+                    const idx = allNewsItems.findIndex(i => i.id === updated.id);
+                    if (idx !== -1) allNewsItems[idx] = updated;
+                    renderNews();
+                    showToast('Update logged to the Knowledge Timeline.');
+                } catch (err) {
+                    showToast('Could not log that update  try again.');
+                } finally {
+                    e.target.disabled = false;
+                }
+                return;
+            }
+
+            let newStatus = null;
+            if (e.target.classList.contains('news-approve-btn')) newStatus = 'published';
+            if (e.target.classList.contains('news-reject-btn')) newStatus = 'rejected';
+            if (!newStatus) return;
+            e.target.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/api/news/admin/${id}/`, {
+                    method: 'PATCH', headers: authHeaders(), body: JSON.stringify({ status: newStatus }),
+                });
+                if (res.status === 401) return logout();
+                if (!res.ok) throw new Error('update failed');
+                const updated = await res.json();
+                const idx = allNewsItems.findIndex(i => i.id === updated.id);
+                if (idx !== -1) allNewsItems[idx] = updated;
+                renderNews();
+                showToast(newStatus === 'published' ? 'Draft published' : 'Draft rejected');
+            } catch (err) {
+                showToast('Could not update that draft  try again.');
+            } finally {
+                e.target.disabled = false;
+            }
+        });
+
+        // --------------------------------------------------------- hardware
+        // Mirrors the News tab: same moderation shape (pending/published/
+        // rejected + approve/reject + log-update), against hardware's own
+        // admin API (backend/hardware/admin_views.py). The article JSON
+        // differs from news: no trending_score, and source lives in a
+        // sources[] array rather than top-level source_url/source_name.
+
+        let allHardwareItems = [];
+        let currentHardwareStatus = 'pending';
+
+        async function loadHardware() {
+            const res = await fetch(`${API_BASE}/api/hardware/admin/articles/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            if (!res.ok) return;
+            const data = await res.json();
+            allHardwareItems = data.items;
+            renderHardware();
+        }
+
+        function renderHardware() {
+            const items = allHardwareItems.filter(i => i.status === currentHardwareStatus);
+            const list = document.getElementById('hardwareList');
+            document.getElementById('hardwareEmpty').classList.toggle('hidden', items.length > 0);
+            list.innerHTML = items.map(i => {
+                const primary = (i.sources || []).find(s => s.is_primary) || (i.sources || [])[0] || null;
+                return `
+                <div class="news-item" data-hw-id="${i.id}" data-hw-category="${escapeHtml(i.category)}">
+                    <div class="title">${escapeHtml(i.title)}</div>
+                    <div class="meta">${escapeHtml(i.category_display)}${primary ? ` &middot; ${escapeHtml(primary.name)}` : ''} &middot; ${i.reading_time_minutes} min read &middot; ${formatDateTime(i.created_at)}${i.updates && i.updates.length ? ` &middot; ${i.updates.length} update(s) logged` : ''}</div>
+                    <div class="summary">${escapeHtml(i.ai_summary)}</div>
+                    ${renderArticleThumb(i.image, 'hw-change-picture-btn')}
+                    <div class="flex gap-2 flex-wrap">
+                        ${primary ? `<a href="${primary.url}" target="_blank" rel="noopener" class="secondary-btn text-xs px-3 py-1.5 rounded-md">Source</a>` : ''}
+                        ${i.status !== 'published' ? `<button class="cta-btn text-xs px-3 py-1.5 rounded-md text-white hw-approve-btn">Approve &amp; Publish</button>` : ''}
+                        ${i.status !== 'rejected' ? `<button class="secondary-btn text-xs px-3 py-1.5 rounded-md hw-reject-btn">Reject</button>` : ''}
+                        ${i.status === 'published' ? `<button class="secondary-btn text-xs px-3 py-1.5 rounded-md hw-log-update-btn">+ Log Update</button>` : ''}
+                    </div>
+                    ${i.status === 'published' ? `
+                    <div class="hw-update-form hidden" style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid #1f2937;">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mb-2">
+                            <select class="field-select hw-update-kind text-xs">
+                                <option value="update">Content Update</option>
+                                <option value="advisory">Advisory / Release Note</option>
+                                <option value="correction">Correction</option>
+                            </select>
+                            <input type="text" class="field-input hw-update-title text-xs md:col-span-2" placeholder="What changed (e.g. 'Price confirmed at launch')">
+                        </div>
+                        <textarea class="field-input hw-update-desc text-xs w-full mb-2" rows="2" placeholder="Details (optional)"></textarea>
+                        <button class="cta-btn text-xs px-3 py-1.5 rounded-md text-white hw-submit-update-btn">Save Update</button>
+                    </div>` : ''}
+                </div>`;
+            }).join('');
+        }
+
+        document.getElementById('hardwareStatusFilter').addEventListener('click', (e) => {
+            const btn = e.target.closest('.hw-filter-btn');
+            if (!btn) return;
+            document.querySelectorAll('.hw-filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentHardwareStatus = btn.dataset.hwStatus;
+            renderHardware();
+        });
+
+        document.getElementById('hardwareList').addEventListener('click', async (e) => {
+            const row = e.target.closest('[data-hw-id]');
+            if (!row) return;
+            const id = row.dataset.hwId;
+
+            if (e.target.classList.contains('hw-change-picture-btn')) {
+                openImagePicker('hardware', row.dataset.hwCategory, async (chosen) => {
+                    try {
+                        const res = await fetch(`${API_BASE}/api/hardware/admin/articles/${id}/image/`, {
+                            method: 'PATCH', headers: authHeaders(), body: JSON.stringify(chosen),
+                        });
+                        if (res.status === 401) return logout();
+                        if (!res.ok) throw new Error('image update failed');
+                        const updated = await res.json();
+                        const idx = allHardwareItems.findIndex(i => i.id === updated.id);
+                        if (idx !== -1) allHardwareItems[idx] = updated;
+                        renderHardware();
+                        showToast('Picture updated.');
+                    } catch (err) {
+                        showToast('Could not update the picture  try again.');
+                    }
+                });
+                return;
+            }
+
+            if (e.target.classList.contains('hw-log-update-btn')) {
+                row.querySelector('.hw-update-form').classList.toggle('hidden');
+                return;
+            }
+
+            if (e.target.classList.contains('hw-submit-update-btn')) {
+                const form = row.querySelector('.hw-update-form');
+                const kind = form.querySelector('.hw-update-kind').value;
+                const title = form.querySelector('.hw-update-title').value.trim();
+                const description = form.querySelector('.hw-update-desc').value.trim();
+                if (!title) { showToast('Give the update a short title first.'); return; }
+                e.target.disabled = true;
+                try {
+                    const res = await fetch(`${API_BASE}/api/hardware/admin/articles/${id}/updates/`, {
+                        method: 'POST', headers: authHeaders(), body: JSON.stringify({ kind, title, description }),
+                    });
+                    if (res.status === 401) return logout();
+                    if (!res.ok) throw new Error('log failed');
+                    const updated = await res.json();
+                    const idx = allHardwareItems.findIndex(i => i.id === updated.id);
+                    if (idx !== -1) allHardwareItems[idx] = updated;
+                    renderHardware();
+                    showToast('Update logged to the Knowledge Timeline.');
+                } catch (err) {
+                    showToast('Could not log that update  try again.');
+                } finally {
+                    e.target.disabled = false;
+                }
+                return;
+            }
+
+            let newStatus = null;
+            if (e.target.classList.contains('hw-approve-btn')) newStatus = 'published';
+            if (e.target.classList.contains('hw-reject-btn')) newStatus = 'rejected';
+            if (!newStatus) return;
+            e.target.disabled = true;
+            try {
+                const res = await fetch(`${API_BASE}/api/hardware/admin/articles/${id}/`, {
+                    method: 'PATCH', headers: authHeaders(), body: JSON.stringify({ status: newStatus }),
+                });
+                if (res.status === 401) return logout();
+                if (!res.ok) throw new Error('update failed');
+                const updated = await res.json();
+                const idx = allHardwareItems.findIndex(i => i.id === updated.id);
+                if (idx !== -1) allHardwareItems[idx] = updated;
+                renderHardware();
+                showToast(newStatus === 'published' ? 'Story published' : 'Story rejected');
+            } catch (err) {
+                showToast('Could not update that story  try again.');
+            } finally {
+                e.target.disabled = false;
+            }
+        });
+
+        // ----------------------------------------------------------- users
+
+        async function loadUsers() {
+            const res = await fetch(`${API_BASE}/api/accounts/admin/users/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            const data = await res.json();
+            currentUsers = data.users;
+            animateCounter('statUsers', data.users.length);
+            const tbody = document.getElementById('usersTableBody');
+            document.getElementById('usersEmpty').classList.toggle('hidden', data.users.length > 0);
+            tbody.innerHTML = data.users.map(u => {
+                const isSelf = currentMe && u.id === currentMe.id;
+                const isOtherSuperuser = u.is_superuser && !isSelf;
+                return `
+                <tr data-user-id="${u.id}">
+                    <td class="font-medium">${escapeHtml(u.email)}${u.is_superuser ? ' <span class="badge plan-premium">Superuser</span>' : (u.is_staff ? ' <span class="badge" style="background:rgba(168,85,247,0.15);color:#c084fc;border:1px solid rgba(168,85,247,0.35);">Staff</span>' : '')}</td>
+                    <td class="text-gray-400">${formatDate(u.date_joined)}</td>
+                    <td>
+                        <div style="display:flex;align-items:center;gap:6px;" ${u.paid_subscriber ? 'title="Paid subscriber  plan is managed by the payment system until it expires."' : ''}>
+                            <select class="field-select role-select plan-select" ${isOtherSuperuser || u.paid_subscriber ? 'disabled' : ''}>
+                                <option value="free" ${u.plan === 'free' ? 'selected' : ''}>Free</option>
+                                <option value="premium" ${u.plan === 'premium' ? 'selected' : ''}>Premium</option>
+                            </select>
+                            ${u.paid_subscriber ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" style="flex-shrink:0;"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>' : ''}
+                        </div>
+                    </td>
+                    <td class="text-gray-400">${u.subscription_active ? 'Yes' : 'No'}</td>
+                    <td class="text-gray-400">${formatDate(u.expires_at)}</td>
+                    <td class="text-gray-400">${formatDate(u.last_login)}</td>
+                    <td>
+                        <label class="cockpit-switch" title="Staff: can post blog articles">
+                            <input type="checkbox" class="staff-toggle" ${u.is_staff ? 'checked' : ''} ${isOtherSuperuser || isSelf ? 'disabled' : ''}>
+                            <span class="track"></span>
+                        </label>
+                    </td>
+                    <td>
+                        <button class="danger-btn px-3 py-1.5 rounded-md text-xs delete-user-btn" ${isOtherSuperuser || isSelf ? 'disabled style="opacity:0.35;cursor:not-allowed;"' : ''}>Delete</button>
+                    </td>
+                </tr>`;
+            }).join('');
+        }
+
+        async function patchUser(userId, body) {
+            const res = await fetch(`${API_BASE}/api/accounts/admin/users/${userId}/`, {
+                method: 'PATCH', headers: authHeaders(), body: JSON.stringify(body),
+            });
+            if (res.status === 401) { logout(); return null; }
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.message || 'Update failed.');
+            }
+            return res.json();
+        }
+
+        document.getElementById('usersTableBody').addEventListener('change', async (e) => {
+            const row = e.target.closest('tr[data-user-id]');
+            if (!row) return;
+            const userId = row.dataset.userId;
+
+            if (e.target.classList.contains('staff-toggle')) {
+                const isStaff = e.target.checked;
+                e.target.disabled = true;
+                try {
+                    await patchUser(userId, { is_staff: isStaff });
+                    showToast(isStaff ? 'Promoted to staff  can now post blog articles.' : 'Staff access revoked.');
+                    await loadUsers();
+                    loadActivity();
+                } catch (err) {
+                    e.target.checked = !isStaff;
+                    showToast(err.message);
+                    e.target.disabled = false;
+                }
+            }
+
+            if (e.target.classList.contains('plan-select')) {
+                const plan = e.target.value;
+                let trialDays = 0;
+                if (plan === 'premium') {
+                    const input = prompt('Grant Premium  trial length in days (leave blank / 0 for a permanent paid plan):', '0');
+                    if (input === null) { await loadUsers(); return; } // cancelled  reload to reset the select
+                    trialDays = parseInt(input, 10);
+                    if (isNaN(trialDays) || trialDays < 0 || trialDays > 365) {
+                        showToast('Enter a number of days between 0 and 365.');
+                        await loadUsers();
+                        return;
+                    }
+                }
+                try {
+                    await patchUser(userId, { plan, trial_days: trialDays });
+                    showToast(plan === 'premium' ? (trialDays ? `Premium trial granted (${trialDays}d).` : 'Set to Premium (paid).') : 'Set to Free.');
+                    await loadUsers();
+                    loadActivity();
+                } catch (err) {
+                    showToast(err.message);
+                    await loadUsers();
+                }
+            }
+        });
+
+        // ------------------------------------------------- delete w/ countdown
+
+        let dangerTimer = null;
+        let dangerTargetId = null;
+
+        function openDangerModal(userId, email) {
+            dangerTargetId = userId;
+            document.getElementById('dangerTargetEmail').textContent = email;
+            document.getElementById('dangerOverlay').classList.remove('hidden');
+            const btn = document.getElementById('dangerConfirmBtn');
+            const labelEl = document.getElementById('dangerBtnLabel');
+            const countEl = document.getElementById('dangerCountdown');
+            btn.disabled = true;
+            btn.classList.remove('armed');
+            let remaining = 5;
+            labelEl.textContent = 'Arming…';
+            countEl.textContent = remaining;
+            countEl.style.display = '';
+            if (dangerTimer) clearInterval(dangerTimer);
+            dangerTimer = setInterval(() => {
+                remaining -= 1;
+                if (remaining <= 0) {
+                    clearInterval(dangerTimer);
+                    btn.disabled = false;
+                    btn.classList.add('armed');
+                    labelEl.textContent = 'Confirm  Delete Permanently';
+                    countEl.style.display = 'none';
+                } else {
+                    countEl.textContent = remaining;
+                }
+            }, 1000);
+        }
+
+        function closeDangerModal() {
+            if (dangerTimer) clearInterval(dangerTimer);
+            dangerTargetId = null;
+            document.getElementById('dangerOverlay').classList.add('hidden');
+        }
+
+        document.getElementById('usersTableBody').addEventListener('click', (e) => {
+            const btn = e.target.closest('.delete-user-btn');
+            if (!btn || btn.disabled) return;
+            const row = btn.closest('tr[data-user-id]');
+            const userId = row.dataset.userId;
+            const user = currentUsers.find(u => String(u.id) === String(userId));
+            openDangerModal(userId, user ? user.email : `user #${userId}`);
+        });
+
+        document.getElementById('dangerCancelBtn').addEventListener('click', closeDangerModal);
+
+        document.getElementById('dangerConfirmBtn').addEventListener('click', async () => {
+            if (!dangerTargetId) return;
+            const btn = document.getElementById('dangerConfirmBtn');
+            btn.disabled = true;
+            document.getElementById('dangerBtnLabel').textContent = 'Deleting…';
+            try {
+                const res = await fetch(`${API_BASE}/api/accounts/admin/users/${dangerTargetId}/`, {
+                    method: 'DELETE', headers: authHeaders(),
+                });
+                if (res.status === 401) return logout();
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.message || 'Delete failed.');
+                showToast(data.message || 'User deleted.');
+                closeDangerModal();
+                await loadUsers();
+                loadActivity();
+            } catch (err) {
+                showToast(err.message);
+                closeDangerModal();
+            }
+        });
+
+        // --------------------------------------------------- transactions
+
+        async function loadTransactions() {
+            const res = await fetch(`${API_BASE}/api/accounts/admin/transactions/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            const data = await res.json();
+            animateCounter('statTransactions', data.transactions.length);
+            const tbody = document.getElementById('transactionsTableBody');
+            document.getElementById('transactionsEmpty').classList.toggle('hidden', data.transactions.length > 0);
+            tbody.innerHTML = data.transactions.map(t => `
+                <tr>
+                    <td class="font-medium">${escapeHtml(t.user_email)}</td>
+                    <td>${escapeHtml(t.amount)} ${escapeHtml(t.currency)}</td>
+                    <td class="text-gray-400">${escapeHtml(t.provider)}</td>
+                    <td><span class="badge status-${t.status}">${t.status}</span></td>
+                    <td class="text-gray-500 text-xs">${escapeHtml(t.provider_ref) || ''}</td>
+                    <td class="text-gray-400">${formatDate(t.created_at)}</td>
+                </tr>
+            `).join('');
+        }
+
+        // ----------------------------------------------------------- tools
+
+        const CATEGORY_LABELS_TOOLS = { 'dev-tools': 'Developer Tools', 'ai-tools': 'AI Tools', 'network-tools': 'Network Tools' };
+
+        async function loadTools() {
+            const res = await fetch(`${API_BASE}/api/admin/tools/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            const data = await res.json();
+            animateCounter('statTools', data.tools.length);
+            const groups = {};
+            data.tools.forEach(t => { (groups[t.category] = groups[t.category] || []).push(t); });
+
+            const container = document.getElementById('toolsGroups');
+            container.innerHTML = Object.keys(CATEGORY_LABELS_TOOLS).map(cat => {
+                const tools = groups[cat] || [];
+                return `
+                <div>
+                    <h3 class="text-lg font-bold mb-3">${CATEGORY_LABELS_TOOLS[cat]} <span class="text-gray-500 text-sm font-normal">(${tools.length})</span></h3>
+                    <div class="overflow-x-auto border border-gray-800 rounded-xl">
+                        <table>
+                            <thead><tr><th>Tool</th><th>Status</th><th>Notes</th><th>Updated</th></tr></thead>
+                            <tbody>
+                                ${tools.map(t => `
+                                <tr data-tool-id="${t.id}">
+                                    <td class="font-medium">${escapeHtml(t.name)}</td>
+                                    <td>
+                                        <select class="field-select status-select tool-status-select">
+                                            <option value="operational" ${t.status === 'operational' ? 'selected' : ''}>Operational</option>
+                                            <option value="degraded" ${t.status === 'degraded' ? 'selected' : ''}>Degraded</option>
+                                            <option value="down" ${t.status === 'down' ? 'selected' : ''}>Down</option>
+                                        </select>
+                                    </td>
+                                    <td><input type="text" class="field-input tool-notes-input" placeholder="Notes…" value="${escapeHtml(t.notes)}"></td>
+                                    <td class="text-gray-500 text-xs whitespace-nowrap">${formatDate(t.updated_at)}</td>
+                                </tr>`).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        async function saveToolField(row) {
+            const id = row.dataset.toolId;
+            const status = row.querySelector('.tool-status-select').value;
+            const notes = row.querySelector('.tool-notes-input').value;
+            const res = await fetch(`${API_BASE}/api/admin/tools/${id}/`, {
+                method: 'PUT', headers: authHeaders(), body: JSON.stringify({ status, notes }),
+            });
+            if (res.status === 401) return logout();
+            if (res.ok) {
+                showToast('Tool updated');
+                row.querySelector('.text-xs.whitespace-nowrap').textContent = formatDate(new Date().toISOString());
+            }
+        }
+
+        document.getElementById('toolsGroups').addEventListener('change', (e) => {
+            if (e.target.classList.contains('tool-status-select')) saveToolField(e.target.closest('tr'));
+        });
+        document.getElementById('toolsGroups').addEventListener('blur', (e) => {
+            if (e.target.classList.contains('tool-notes-input')) saveToolField(e.target.closest('tr'));
+        }, true);
+
+        // ------------------------------------------------------------ blog
+        // Mounted once into either #staffBlogHost (staff-only accounts) or
+        // #superuserBlogHost (superuser's Blog tab)  same template, same
+        // IDs either way since only one host is ever populated per session.
+
+        function mountBlogPanel(hostEl) {
+            const tpl = document.getElementById('blogPanelTemplate');
+            hostEl.appendChild(tpl.content.cloneNode(true));
+            wireBlogPanel();
+        }
+
+        function slugify(text) {
+            return text.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+        }
+
+        async function loadCategories() {
+            const res = await fetch(`${API_BASE}/api/blog/admin/categories/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            const data = await res.json();
+            categories = data.categories;
+            const sel = document.getElementById('fieldCategory');
+            if (sel) sel.innerHTML = categories.map(c => `<option value="${c.slug}">${c.name}</option>`).join('');
+        }
+
+        async function loadPosts() {
+            const res = await fetch(`${API_BASE}/api/blog/admin/posts/`, { headers: authHeaders() });
+            if (res.status === 401) return logout();
+            const data = await res.json();
+            posts = data.posts;
+            animateCounter('statPosts', posts.length);
+            renderPostList();
+        }
+
+        function renderPostList() {
+            const list = document.getElementById('postList');
+            if (!list) return;
+            document.getElementById('postsEmpty').classList.toggle('hidden', posts.length > 0);
+            list.innerHTML = posts.map(p => `
+                <div class="post-row p-4 flex items-center justify-between gap-4">
+                    <div class="min-w-0">
+                        <div class="flex items-center gap-2 mb-1">
+                            <span class="badge ${p.is_published ? 'status-published' : 'status-draft'}">${p.is_published ? 'Published' : 'Draft'}</span>
+                            <span class="text-gray-500 text-xs">${escapeHtml(p.category.name)}</span>
+                        </div>
+                        <div class="font-medium truncate">${escapeHtml(p.title)}</div>
+                    </div>
+                    <button class="secondary-btn px-4 py-2 rounded-lg text-sm shrink-0" data-edit-id="${p.id}">Edit</button>
+                </div>
+            `).join('');
+        }
+
+        function showBlogListView() {
+            document.getElementById('blogEditView').classList.add('hidden');
+            document.getElementById('blogListView').classList.remove('hidden');
+        }
+
+        function showBlogEditView(post) {
+            document.getElementById('blogListView').classList.add('hidden');
+            document.getElementById('blogEditView').classList.remove('hidden');
+            document.getElementById('previewPane').classList.add('hidden');
+            document.getElementById('togglePreviewBtn').textContent = 'Show preview';
+
+            document.getElementById('editTitle').textContent = post ? 'Edit Post' : 'New Post';
+            document.getElementById('editError').classList.add('hidden');
+            document.getElementById('postId').value = post ? post.id : '';
+            document.getElementById('fieldTitle').value = post ? post.title : '';
+            document.getElementById('fieldSlug').value = post ? post.slug : '';
+            document.getElementById('fieldCategory').value = post ? post.category.slug : categories[0]?.slug || '';
+            document.getElementById('fieldExcerpt').value = post ? post.excerpt : '';
+            document.getElementById('fieldCoverImageUrl').value = post ? post.cover_image_url : '';
+            document.getElementById('fieldAuthorName').value = post ? post.author_name : 'CoreRipper Team';
+            document.getElementById('fieldAuthorInitials').value = post ? post.author_initials : 'CL';
+            document.getElementById('fieldContent').value = post ? post.content : '';
+            document.getElementById('fieldPublished').checked = post ? post.is_published : false;
+            document.getElementById('deleteBtn').classList.toggle('hidden', !post);
+            updateCoverImagePreview();
+        }
+
+        function updateCoverImagePreview() {
+            const url = document.getElementById('fieldCoverImageUrl').value.trim();
+            const preview = document.getElementById('coverImagePreview');
+            preview.classList.toggle('hidden', !url);
+            if (url) preview.src = url;
+        }
+
+        async function handleSavePost(e) {
+            e.preventDefault();
+            const id = document.getElementById('postId').value;
+            const body = {
+                title: document.getElementById('fieldTitle').value.trim(),
+                slug: document.getElementById('fieldSlug').value.trim(),
+                category: document.getElementById('fieldCategory').value,
+                excerpt: document.getElementById('fieldExcerpt').value.trim(),
+                cover_image_url: document.getElementById('fieldCoverImageUrl').value.trim(),
+                author_name: document.getElementById('fieldAuthorName').value.trim(),
+                author_initials: document.getElementById('fieldAuthorInitials').value.trim(),
+                content: document.getElementById('fieldContent').value,
+                is_published: document.getElementById('fieldPublished').checked,
+            };
+            const errorBox = document.getElementById('editError');
+            errorBox.classList.add('hidden');
+            const saveBtn = document.getElementById('saveBtn');
+            saveBtn.disabled = true;
+
+            try {
+                const url = id ? `${API_BASE}/api/blog/admin/posts/${id}/` : `${API_BASE}/api/blog/admin/posts/`;
+                const method = id ? 'PUT' : 'POST';
+                const res = await fetch(url, { method, headers: authHeaders(), body: JSON.stringify(body) });
+                if (res.status === 401) return logout();
+                if (!res.ok) {
+                    const data = await res.json().catch(() => ({}));
+                    throw new Error(data.message || 'Could not save the post  check every field is filled in.');
+                }
+                await loadPosts();
+                showBlogListView();
+                showToast(id ? 'Post updated' : 'Post created');
+            } catch (err) {
+                errorBox.textContent = err.message;
+                errorBox.classList.remove('hidden');
+            } finally {
+                saveBtn.disabled = false;
+            }
+        }
+
+        async function handleDeletePost() {
+            const id = document.getElementById('postId').value;
+            if (!id) return;
+            if (!confirm('Delete this post permanently?')) return;
+            const res = await fetch(`${API_BASE}/api/blog/admin/posts/${id}/`, { method: 'DELETE', headers: authHeaders() });
+            if (res.status === 401) return logout();
+            if (!res.ok) return;
+            await loadPosts();
+            showBlogListView();
+            showToast('Post deleted');
+        }
+
+        function togglePreview() {
+            const pane = document.getElementById('previewPane');
+            const btn = document.getElementById('togglePreviewBtn');
+            const showing = !pane.classList.contains('hidden');
+            if (showing) {
+                pane.classList.add('hidden');
+                btn.textContent = 'Show preview';
+            } else {
+                const raw = marked.parse(document.getElementById('fieldContent').value || '');
+                pane.innerHTML = DOMPurify.sanitize(raw);
+                pane.classList.remove('hidden');
+                btn.textContent = 'Hide preview';
+            }
+        }
+
+        let slugManuallyEdited = false;
+
+        function wireBlogPanel() {
+            document.getElementById('newPostBtn').addEventListener('click', () => { slugManuallyEdited = false; showBlogEditView(null); });
+            document.getElementById('backToListBtn').addEventListener('click', showBlogListView);
+            document.getElementById('postForm').addEventListener('submit', handleSavePost);
+            document.getElementById('deleteBtn').addEventListener('click', handleDeletePost);
+            document.getElementById('togglePreviewBtn').addEventListener('click', togglePreview);
+            document.getElementById('postList').addEventListener('click', (e) => {
+                const btn = e.target.closest('[data-edit-id]');
+                if (!btn) return;
+                const post = posts.find(p => p.id === Number(btn.dataset.editId));
+                showBlogEditView(post);
+            });
+            document.getElementById('fieldSlug').addEventListener('input', () => { slugManuallyEdited = true; });
+            document.getElementById('fieldTitle').addEventListener('input', (e) => {
+                if (!slugManuallyEdited && !document.getElementById('postId').value) {
+                    document.getElementById('fieldSlug').value = slugify(e.target.value);
+                }
+            });
+            document.getElementById('fieldCoverImageUrl').addEventListener('input', updateCoverImagePreview);
+            document.getElementById('coverImageChooseBtn').addEventListener('click', () => {
+                const category = document.getElementById('fieldCategory').value;
+                openImagePicker('blog', category, (chosen) => {
+                    document.getElementById('fieldCoverImageUrl').value = chosen.image_url;
+                    updateCoverImagePreview();
+                });
+            });
+            wireEditorToolbar();
+        }
+
+        // ---------------------------------------------- editor toolbar
+
+        // All three mutators below go through document.execCommand('insertText', …)
+        // rather than a direct `textarea.value = …` assignment. Setting .value
+        // directly wipes the browser's native undo/redo stack for the field 
+        // execCommand is the one programmatic path that both mutates the
+        // textarea AND records a real, Ctrl+Z-undoable step. This is what
+        // powers the Undo/Redo toolbar buttons below (execCommand('undo'/'redo')
+        // on the focused textarea)  there's no separate custom undo stack to
+        // maintain, we're just not breaking the browser's own one anymore.
+        function replaceRange(textarea, start, end, text) {
+            textarea.focus();
+            textarea.setSelectionRange(start, end);
+            document.execCommand('insertText', false, text);
+        }
+
+        // Wrap the current selection with before/after markers, leaving the
+        // inner text selected afterward so repeated clicks feel like a real
+        // rich-text editor (select → bold → still selected → italic…).
+        function applyWrap(textarea, before, after) {
+            const { selectionStart: start, selectionEnd: end, value } = textarea;
+            const selected = value.slice(start, end) || 'text';
+            replaceRange(textarea, start, end, before + selected + after);
+            textarea.setSelectionRange(start + before.length, start + before.length + selected.length);
+        }
+
+        function applyLinePrefix(textarea, prefix) {
+            const { selectionStart: start, selectionEnd: end, value } = textarea;
+            const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+            const block = value.slice(lineStart, end);
+            const prefixed = block.split('\n').map(l => prefix + l).join('\n');
+            replaceRange(textarea, lineStart, end, prefixed);
+            textarea.setSelectionRange(lineStart, lineStart + prefixed.length);
+        }
+
+        // Inserts at an explicit [start, end] range rather than "wherever the
+        // cursor currently is"  callers that go through an async step first
+        // (upload, prompt()) must capture the position BEFORE that step, since
+        // focus (and so selectionStart/End) is unreliable once it returns.
+        function insertAtRange(textarea, start, end, snippet) {
+            replaceRange(textarea, start, end, snippet);
+            const pos = start + snippet.length;
+            textarea.setSelectionRange(pos, pos);
+        }
+
+        function wireEditorToolbar() {
+            const toolbar = document.getElementById('editorToolbar');
+            const textarea = document.getElementById('fieldContent');
+            if (!toolbar || !textarea) return;
+
+            document.getElementById('undoBtn').addEventListener('click', () => {
+                textarea.focus();
+                document.execCommand('undo');
+            });
+            document.getElementById('redoBtn').addEventListener('click', () => {
+                textarea.focus();
+                document.execCommand('redo');
+            });
+
+            toolbar.addEventListener('click', (e) => {
+                const btn = e.target.closest('button');
+                if (!btn) return;
+                if (btn.dataset.mdWrap) {
+                    const [before, after] = btn.dataset.mdWrap.split('|');
+                    applyWrap(textarea, before, after);
+                } else if (btn.dataset.mdLine) {
+                    applyLinePrefix(textarea, btn.dataset.mdLine);
+                }
+            });
+
+            document.getElementById('insertLinkBtn').addEventListener('click', () => {
+                const { selectionStart: start, selectionEnd: end, value } = textarea;
+                const url = prompt('Link URL:', 'https://');
+                if (!url) return;
+                const label = value.slice(start, end) || 'link text';
+                insertAtRange(textarea, start, end, `[${label}](${url})`);
+            });
+
+            const fileInput = document.getElementById('imageUploadInput');
+            const imageBtn = document.getElementById('insertImageBtn');
+
+            // Capture where the image should land the instant the button is
+            // clicked  the native OS file dialog that opens next steals
+            // focus, and by the time it returns (change event, then the
+            // upload's own await) the textarea's selection can no longer be
+            // trusted to still point at "where the user was."
+            let insertAt = null;
+            imageBtn.addEventListener('click', () => {
+                insertAt = { start: textarea.selectionStart, end: textarea.selectionEnd };
+                fileInput.click();
+            });
+
+            fileInput.addEventListener('change', async () => {
+                const file = fileInput.files[0];
+                fileInput.value = '';
+                if (!file) return;
+                const at = insertAt || { start: textarea.value.length, end: textarea.value.length };
+                imageBtn.disabled = true;
+                imageBtn.textContent = 'Uploading…';
+                try {
+                    const formData = new FormData();
+                    formData.append('image', file);
+                    const res = await fetch(`${API_BASE}/api/blog/admin/upload-image/`, {
+                        method: 'POST',
+                        headers: { Authorization: `Bearer ${token}` }, // no Content-Type: browser sets the multipart boundary
+                        body: formData,
+                    });
+                    if (res.status === 401) return logout();
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(data.message || 'Upload failed.');
+                    const alt = file.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ');
+                    // insertAtRange goes through execCommand('insertText'), same
+                    // as every other toolbar action  keeps the browser's
+                    // native undo/redo stack intact for this insertion too.
+                    insertAtRange(textarea, at.start, at.end, `\n\n![${alt}](${data.url})\n\n`);
+                    showToast('Image uploaded and inserted');
+                } catch (err) {
+                    showToast(err.message);
+                } finally {
+                    imageBtn.disabled = false;
+                    imageBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg> Image';
+                }
+            });
+        }
+
+        // --------------------------------------------------------- wiring
+
+        document.getElementById('logoutBtn').addEventListener('click', logout);
+
+        init();
+    </script>
+<!-- CR_OS_MODE_START -->
+<script>
+(function () {
+    fetch(window.CR_API_BASE + '/api/features/')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+            if (!d || !d.features || d.features.monetization !== false) return;
+            // Hide Pricing nav link (desktop + mobile)
+            document.querySelectorAll('a[href="pricing.html"], a[href="../pricing.html"]').forEach(function (a) {
+                if (a.textContent.trim() === 'Pricing') a.style.display = 'none';
+            });
+            // Hide Billing nav dropdown item (nothing to bill while monetization is off)
+            document.querySelectorAll('a[href="billing.html"], a[href="../billing.html"]').forEach(function (a) {
+                if (a.textContent.trim() === 'Billing') a.style.display = 'none';
+            });
+            // Hide credit chip
+            var cc = document.getElementById('crCreditWrap');
+            if (cc) cc.style.display = 'none';
+            var creditCta = document.querySelector('.cr-credit-cta');
+            if (creditCta) creditCta.style.display = 'none';
+            // Hide "Sonnet-5 credits" label in dropdown
+            document.querySelectorAll('.cr-dd-email').forEach(function (el) {
+                if (el.textContent.trim() === 'Sonnet-5 credits') el.style.display = 'none';
+            });
+            // Dashboard: hide PREMIUM pill + credits pill
+            var pill = document.getElementById('wbPlanPill');
+            if (pill) pill.style.display = 'none';
+            var cpill = document.getElementById('creditsPill');
+            if (cpill) cpill.style.display = 'none';
+        })
+        .catch(function () {});
+})();
+</script>
+<!-- CR_OS_MODE_END -->
+</body>
+</html>
