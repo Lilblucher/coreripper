@@ -1374,11 +1374,11 @@ document.addEventListener('keydown', function (e) {
                 <form id="verifyStep" class="space-y-5 hidden">
                     <div>
                         <h2 class="text-lg font-semibold text-white mb-1">Check your email</h2>
-                        <p class="text-gray-400 text-sm mb-4">We sent a 6-digit code to <span id="verifyEmailLabel" class="text-gray-200 font-medium"></span>. Enter it below to finish signing up.</p>
+                        <p class="text-gray-400 text-sm mb-4">We sent a 8-digit code to <span id="verifyEmailLabel" class="text-gray-200 font-medium"></span>. Enter it below to finish signing up.</p>
                         <label class="field-label">Verification code</label>
                         <div class="field-wrap">
                             <svg class="field-icon w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
-                            <input type="text" id="verifyCode" class="field-input" placeholder="123456" inputmode="numeric" maxlength="6" autocomplete="one-time-code" required>
+                            <input type="text" id="verifyCode" class="field-input" placeholder="A3X9KP4R" maxlength="8" autocomplete="one-time-code" required style="letter-spacing: 0.18em; text-transform: uppercase;">
                         </div>
                     </div>
                     <button type="submit" id="verifyBtn" class="cta-btn w-full py-3 rounded-lg font-semibold text-white flex items-center justify-center gap-2">
@@ -1598,7 +1598,8 @@ document.addEventListener('keydown', function (e) {
                     const messages = {
                         invalid_code: 'Incorrect or expired code.',
                         expired_code: 'This code has expired. Request a new one.',
-                        already_verified: 'This email is already verified  please log in.',
+                        already_verified: 'This email is already verified — please log in.',
+                    too_many_attempts: 'Too many incorrect attempts. Click "Resend it" to get a new code.',
                     };
                     throw new Error(messages[data.error] || 'Could not verify your email.');
                 }

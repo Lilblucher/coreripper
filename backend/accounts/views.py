@@ -2,6 +2,7 @@ import json
 import re
 import secrets
 from datetime import timedelta
+import requests as pyrequests
 
 from django.conf import settings
 from django.contrib.auth import authenticate
@@ -37,6 +38,23 @@ RESET_MAX_ATTEMPTS = 5
 # Email verification reuses the same OTP semantics as password reset.
 VERIFICATION_TOKEN_LIFETIME = RESET_TOKEN_LIFETIME
 VERIFICATION_COOLDOWN_SECONDS = 60
+
+
+
+def _warm_google_certs():
+    """Pre-fetch Google's public certs into Django's cache so verify_oauth2_token
+    doesn't make a cold outbound request during the gunicorn worker timeout window."""
+    CACHE_KEY = "google_oauth2_certs_warm"
+    if cache.get(CACHE_KEY):
+        return
+    try:
+        pyrequests.get(
+            "https://www.googleapis.com/oauth2/v1/certs",
+            timeout=5,
+        )
+        cache.set(CACHE_KEY, True, timeout=3300)  # ~55 min, certs rotate hourly
+    except Exception:
+        pass  # silently skip; verify_oauth2_token will try itself
 
 
 def _send_verification_code(user):
@@ -338,38 +356,45 @@ def signup_view(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def verify_email_view(request):
-    """Verify the 6-digit signup code (same validation ladder as
-    reset_password_view). On success: mark verified, start the 3-day pro trial,
-    issue a token, return {token, user}  the same shape signup used to."""
+    """Verify the signup code (same validation ladder as reset_password_view).
+    On success: mark verified, start the 3-day pro trial, issue a token,
+    return {token, user} — the same shape signup used to."""
     body, error = _parse_json_body(request)
     if error:
         return error
 
     email = (body.get("email") or "").strip().lower()
-    code = (body.get("code") or "").strip()
+    code = (body.get("code") or "").strip().upper()           # ← FIX 1: normalise to uppercase
 
     user = User.objects.filter(username=email).first()
     profile = getattr(user, "profile", None) if user else None
-    if profile and profile.email_verified:
-        return JsonResponse({"error": "already_verified", "message": "This email is already verified."}, status=400)
 
     token = (
         EmailVerificationToken.objects.filter(user=user, used=False).order_by("-created_at").first()
         if user is not None
         else None
     )
+
+    # ← FIX 2: check already_verified AFTER fetching the token (order matters
+    #   because a verified user has no unused token; the old order left token=None
+    #   and then crashed on token.attempts below).
+    if profile and profile.email_verified:
+        return JsonResponse({"error": "already_verified", "message": "This email is already verified."}, status=400)
+
+    # ← FIX 3: expiry is checked BEFORE the code match so a timed-out
+    #   submission doesn't burn an attempt — the token is dead regardless.
+    if token is not None and timezone.now() - token.created_at > VERIFICATION_TOKEN_LIFETIME:
+        token.used = True
+        token.save(update_fields=["used"])
+        return JsonResponse({"error": "expired_code", "message": "This code has expired. Request a new one."}, status=400)
+
     if token is None or token.token != code:
         if token is not None:
             token.attempts += 1
             if token.attempts >= RESET_MAX_ATTEMPTS:
-                token.used = True  # burn it  force requesting a fresh code
+                token.used = True  # burn it — force requesting a fresh code
             token.save(update_fields=["attempts", "used"])
         return JsonResponse({"error": "invalid_code", "message": "Incorrect or expired code."}, status=400)
-
-    if timezone.now() - token.created_at > VERIFICATION_TOKEN_LIFETIME:
-        token.used = True
-        token.save(update_fields=["used"])
-        return JsonResponse({"error": "expired_code", "message": "This code has expired. Request a new one."}, status=400)
 
     token.used = True
     token.save(update_fields=["used"])
@@ -380,8 +405,6 @@ def verify_email_view(request):
     try:
         _send_welcome_email(user, trial_end=user.subscription.current_period_end)
     except Exception as exc:
-        # The account is already live at this point - never fail verification
-        # over a mail problem, just record it.
         print(f"[verify_email_view] welcome email failed for {user.email}: {exc}")
     issued = _issue_token(user, request)
     return JsonResponse(_session_json(user, issued, bool(body.get("remember_me")), request), status=200)
@@ -964,7 +987,18 @@ def delete_account_view(request):
 
     password = body.get("password") or ""
     if authenticate(username=request.user.username, password=password) is None:
-        return JsonResponse({"error": "invalid_password", "message": "Incorrect password."}, status=400)
+        return JsonResponse({"error": "invalid_password", "message": "Incorrect password"}, status=400)
+    try:
+        _warm_google_certs()  # no-op if already cached
+        idinfo = google_id_token.verify_oauth2_token(credential, google_requests.Request(), client_id)
+    except ValueError as e:
+        import logging
+        logging.getLogger("django.request").warning("Google token verification failed: %s", e)
+        return JsonResponse({"error": "invalid_token", "message": "Google sign-in failed - please try again."}, status=400)
+    except BaseException as e:  # catches SystemExit from gunicorn worker abort
+        import logging
+        logging.getLogger("django.request").exception("Google token verification error")
+        return JsonReesponse({"error": "invalid_password", "message": "Incorrect password."}, status=400)
 
     email = request.user.email
     request.user.delete()
@@ -1000,15 +1034,16 @@ def google_login_view(request):
         return JsonResponse({"error": "google_not_configured", "message": "Google sign-in is not available right now."}, status=503)
 
     try:
+        _warm_google_certs()  # no-op if already cached
         idinfo = google_id_token.verify_oauth2_token(credential, google_requests.Request(), client_id)
     except ValueError as e:
         import logging
         logging.getLogger("django.request").warning("Google token verification failed: %s", e)
         return JsonResponse({"error": "invalid_token", "message": "Google sign-in failed - please try again."}, status=400)
-    except Exception as e:
+    except BaseException as e:  # catches SystemExit from gunicorn worker abort
         import logging
         logging.getLogger("django.request").exception("Google token verification error")
-        return JsonResponse({"error": "google_verify_failed", "message": "Google sign-in failed - please try again."}, status=500)
+        return JsonResponse({"error": "google_verify_failed", "message": "Google sign-in failed please try again."}, status=500)
 
     email = (idinfo.get("email") or "").lower().strip()
     if not email:

@@ -1,4 +1,5 @@
 import secrets
+import string
 
 from django.conf import settings
 from django.db import models
@@ -6,6 +7,13 @@ from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
 
+
+
+
+def _generate_verification_code():
+    # Alphanumeric uppercase, minus ambiguous chars O, 0, I, 1, L
+    alphabet = [c for c in (string.ascii_uppercase + string.digits) if c not in 'O0I1L']
+    return ''.join(secrets.choice(alphabet) for _ in range(8))
 
 class Subscription(models.Model):
     # Four tiers (monetization rework). "premium" is retained as a legacy value
@@ -347,7 +355,7 @@ class PasswordResetToken(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.token:
-            self.token = f"{secrets.randbelow(1_000_000):06d}"
+            self.token = _generate_verification_code()
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -364,14 +372,14 @@ class EmailVerificationToken(models.Model):
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="email_verification_tokens"
     )
-    token = models.CharField(max_length=10, editable=False)
+    token = models.CharField(max_length=10, editable=False) # 8-char alphanumeric
     created_at = models.DateTimeField(auto_now_add=True)
     used = models.BooleanField(default=False)
     attempts = models.PositiveSmallIntegerField(default=0)
 
     def save(self, *args, **kwargs):
         if not self.token:
-            self.token = f"{secrets.randbelow(1_000_000):06d}"
+            self.token = _generate_verification_code()   # ← was: f"{secrets.randbelow(1_000_000):06d}"
         super().save(*args, **kwargs)
 
     def __str__(self):
