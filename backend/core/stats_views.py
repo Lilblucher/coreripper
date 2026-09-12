@@ -19,7 +19,7 @@ def public_stats_view(request):
             "ai_tools": Tool.objects.filter(category="ai-tools").count(),
             "network_tools": Tool.objects.filter(category="network-tools").count(),
             "tool_categories": Tool.objects.values("category").distinct().count(),
-            "total_users": User.objects.count(),
+            "total_users": User.objects.filter(profile__email_verified=True).count(),
             "total_posts": Post.objects.filter(is_published=True).count(),
         }
     )
