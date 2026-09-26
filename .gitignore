@@ -220,3 +220,5 @@ __marimo__/
 .env.save
 *.env
 backend/media/blog-images/
+__pycache__/
+**/*.pyc
