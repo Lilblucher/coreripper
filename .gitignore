@@ -219,3 +219,4 @@ __marimo__/
 .env
 .env.save
 *.env
+backend/media/blog-images/
