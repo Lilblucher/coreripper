@@ -333,7 +333,7 @@ class RefreshToken(models.Model):
 
 
 class PasswordResetToken(models.Model):
-    """A one-time-use 6-digit code emailed to a user to authorize a password
+    """A one-time-use 8 digit code emailed to a user to authorize a password
     reset (OTP-style, not a clickable link).
 
     Not a session/cookie mechanism  matches the rest of this app's

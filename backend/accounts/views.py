@@ -437,7 +437,7 @@ def resend_verification_view(request):
             {"error": "cooldown", "message": "A code was sent recently. Check your email or wait a minute."},
             status=429,
         )
-    cache.set(cooldown_key, True, VERIFICATION_COOLDOWN_SECONDS)
+    cache.set(cooldown_key, True, int(VERIFICATION_TOKEN_LIFETIME.total_seconds()))
 
     try:
         _send_verification_code(user)
@@ -510,10 +510,12 @@ def forgot_password_view(request):
     cooldown_key = f"password-reset-cooldown:{email}"
     if cache.get(cooldown_key):
         return JsonResponse(
-            {"error": "cooldown", "message": "A code was already sent recently. Check your email, or wait a minute before requesting another."},
+            {"error": "cooldown", "message": "A reset code was already sent. Please check your email it expires in 15 minutes."},
             status=429,
         )
-    cache.set(cooldown_key, True, RESET_REQUEST_COOLDOWN_SECONDS)
+# Lock for the full token lifetime so no new code can be issued
+# until the current one expires or is used.
+    cache.set(cooldown_key, True, int(RESET_TOKEN_LIFETIME.total_seconds()))
 
     # Only the most recently issued code should be valid at any given time.
     PasswordResetToken.objects.filter(user=user, used=False).update(used=True)
