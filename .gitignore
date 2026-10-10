@@ -222,3 +222,11 @@ __marimo__/
 backend/media/blog-images/
 __pycache__/
 **/*.pyc
+
+# Livia bot runtime
+livia/node_modules/
+livia/sessions/
+livia/.wwebjs_cache/
+livia/.wwebjs_auth/
+livia/knowledge/.memory/
+livia/deploy/**/.env

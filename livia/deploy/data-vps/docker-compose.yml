@@ -1,0 +1,40 @@
+# DATA VPS — runs a dedicated Redis for Livia (cache + conversation memory).
+#
+# Isolation so it never collides with an existing Redis or other sites:
+#  - non-default host port 6380 (host's own 6379 Redis, if any, is untouched)
+#  - password required (set REDIS_PASSWORD in this dir's .env)
+#  - published bound to REDIS_BIND_IP, DEFAULT 127.0.0.1 so it is NOT public by
+#    accident. Set REDIS_BIND_IP to this VPS's PRIVATE network address (the one
+#    the code VPS reaches over Contabo private networking or a WireGuard tunnel).
+#  - AOF persistence on its own named volume.
+#
+# .env in this directory:
+#   REDIS_PASSWORD=a-long-random-string
+#   REDIS_BIND_IP=10.0.0.2        # private IP the code VPS connects to
+#   REDIS_PORT=6380
+name: livia-data
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: livia-redis
+    restart: unless-stopped
+    # requirepass is injected from the env so the secret stays out of redis.conf.
+    command: ["sh", "-c", "redis-server /usr/local/etc/redis/redis.conf --requirepass \"$$REDIS_PASSWORD\""]
+    env_file: .env
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/data-vps/.env}
+    ports:
+      - "${REDIS_BIND_IP:-127.0.0.1}:${REDIS_PORT:-6380}:6379"
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - livia-redis-data:/data
+    networks:
+      - livia-data-net
+
+volumes:
+  livia-redis-data:
+
+networks:
+  livia-data-net:
+    name: livia-data-net

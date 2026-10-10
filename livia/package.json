@@ -1,18 +1,18 @@
 {
-  "name": "Livia AI-whatsapp-bot",
-  "version": "1.0.0",
-  "description": "Livia AI WhatsApp bot (whatsapp-web.js gateway + internal /send API used by CoreRipper's monitors app)",
+  "name": "livia-whatsapp-bot",
+  "version": "2.0.0",
+  "description": "Livia — Clive's personal/social WhatsApp bot (whatsapp-web.js gateway + Groq/Gemini brain with an offline fallback + Redis caching; also hosts the internal /send API used by CoreRipper's monitors app)",
   "main": "whatsapp_bot.js",
   "dependencies": {
-    "cors": "^2.8.6",
+    "dotenv": "^16.4.5",
     "express": "^4.22.2",
-    "node-tesseract-ocr": "^2.2.1",
+    "ioredis": "^5.4.1",
     "qrcode-terminal": "^0.12.0",
     "whatsapp-web.js": "^1.34.7"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node whatsapp_bot.js"
+    "start": "node whatsapp_bot.js",
+    "test": "node test/pipeline_test.js"
   },
   "keywords": [],
   "author": "",

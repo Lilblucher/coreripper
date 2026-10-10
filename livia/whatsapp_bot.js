@@ -1,230 +1,214 @@
+'use strict';
+// Load environment (.env) before anything reads process.env.
+try { require('dotenv').config({ path: require('path').join(__dirname, '.env') }); } catch (_e) {}
+
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const { exec } = require('child_process');
-const ocr = require("node-tesseract-ocr");
-const fs = require('fs'); // For Announcement File Watching
-const path = require('path'); // For Announcement File Pathing
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
-// Tesseract engine configuration matrix
-const ocrConfig = {
-    lang: "eng",
-    oem: 3,
-    psm: 3,
-};
+const { getReply } = require('./brain/reply');
+const cache = require('./brain/cache');
+const memory = require('./brain/memory');
+const knowledge = require('./brain/knowledge');
+
+const BOT_NAME = process.env.BOT_NAME || 'Livia';
+// DM behaviour: 'all' = reply to every direct message (default, most social);
+// 'named' = only reply in DMs when addressed by name. Groups are always named-only.
+const DM_MODE = (process.env.LIVIA_DM_MODE || 'all').toLowerCase();
+const SEND_API_PORT = Number(process.env.SEND_API_PORT || 3001);
+const SEND_API_HOST = process.env.SEND_API_HOST || '127.0.0.1';
+// Flood guard: ignore a sender past this many messages inside the window.
+const FLOOD_MAX = Number(process.env.FLOOD_MAX || 6);
+const FLOOD_WINDOW_SEC = Number(process.env.FLOOD_WINDOW_SEC || 10);
 
 const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: path.join(__dirname, 'sessions') }),
-    puppeteer: {
-        headless: true,
-        executablePath: process.env.CHROME_PATH || '/usr/bin/google-chrome-stable',
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
+  authStrategy: new LocalAuth({ dataPath: path.join(__dirname, 'sessions') }),
+  puppeteer: {
+    headless: true,
+    executablePath: process.env.CHROME_PATH || '/usr/bin/google-chrome-stable',
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  },
 });
 
 let clientReady = false;
+let botId = null; // our own WhatsApp id, for mention detection
 
 client.on('qr', (qr) => {
-    console.log('--- SCAN THIS QR CODE WITH YOUR WHATSAPP TO CONNECT THE BOT ---');
-    qrcode.generate(qr, { small: true });
+  console.log('--- SCAN THIS QR CODE WITH YOUR WHATSAPP TO CONNECT THE BOT ---');
+  qrcode.generate(qr, { small: true });
 });
 
 client.on('ready', () => {
-    clientReady = true;
-    console.log('Livia AI WhatsApp gateway is online!');
+  clientReady = true;
+  try { botId = client.info && client.info.wid && client.info.wid._serialized; } catch (_e) {}
+  console.log(`${BOT_NAME} WhatsApp gateway is online! (DM mode: ${DM_MODE}, cache: ${cache.status().backend})`);
 });
 
 // =============================================================================
-// 📡 INTERNAL SEND API — lets other local services (CoreRipper's Django backend,
-// for monitor alerts) send an outbound WhatsApp message through this same
-// authenticated session. Localhost-only, not exposed publicly.
+// 📡 INTERNAL SEND API — lets other local services (e.g. CoreRipper's Django
+// monitors) send an outbound WhatsApp message through this authenticated
+// session. Bound to localhost by default; keep it off any public interface.
 //
-//   POST http://127.0.0.1:3001/send
-//   { "number": "15551234567", "message": "..." }
-//   number = digits only (country code + number, no '+', spaces, or dashes) —
-//   this handler strips anything else before building the WhatsApp chat id.
-//
-// Matches the probe contract in backend/monitors/whatsapp.py: connection error
-// = bot process down, 503 = bot up but session not linked, 400 on an empty
-// body = ready (reaches payload validation).
+//   POST /send  { "number": "15551234567", "message": "..." }
+// Contract preserved for backend/monitors/whatsapp.py: connection refused = bot
+// down, 503 = up but not linked, 400 on empty body = ready.
 // =============================================================================
-const express = require('express');
 const sendApi = express();
 sendApi.use(express.json());
 
 sendApi.post('/send', async (req, res) => {
-    if (!clientReady) {
-        return res.status(503).json({ status: 'error', message: 'WhatsApp client is not ready yet.' });
-    }
-    const { number, message } = req.body || {};
-    const digits = String(number || '').replace(/[^0-9]/g, '');
-    if (!digits || !message) {
-        return res.status(400).json({ status: 'error', message: "'number' and 'message' are required." });
-    }
-    try {
-        await client.sendMessage(`${digits}@c.us`, message);
-        res.json({ status: 'sent' });
-    } catch (error) {
-        console.error('❌ /send failed:', error.message);
-        res.status(500).json({ status: 'error', message: error.message });
-    }
+  if (!clientReady) {
+    return res.status(503).json({ status: 'error', message: 'WhatsApp client is not ready yet.' });
+  }
+  const { number, message } = req.body || {};
+  const digits = String(number || '').replace(/[^0-9]/g, '');
+  if (!digits || !message) {
+    return res.status(400).json({ status: 'error', message: "'number' and 'message' are required." });
+  }
+  try {
+    await client.sendMessage(`${digits}@c.us`, message);
+    res.json({ status: 'sent' });
+  } catch (error) {
+    console.error('❌ /send failed:', error.message);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
 });
 
-sendApi.listen(3001, '127.0.0.1', () => {
-    console.log('📡 Internal send API listening on http://127.0.0.1:3001 (localhost only)');
+sendApi.listen(SEND_API_PORT, SEND_API_HOST, () => {
+  console.log(`📡 Internal send API listening on http://${SEND_API_HOST}:${SEND_API_PORT}`);
 });
 
 // =============================================================================
-// 📢 MASS ANNOUNCEMENT SYSTEM (FILE WATCHER)
+// 📢 MASS ANNOUNCEMENT SYSTEM (FILE WATCHER) — unchanged behaviour.
 // =============================================================================
 const announcementFilePath = path.join(__dirname, 'announcement.txt');
-
-// Ensure the announcement file exists cleanly
 if (!fs.existsSync(announcementFilePath)) {
-    fs.writeFileSync(announcementFilePath, '', 'utf8');
+  fs.writeFileSync(announcementFilePath, '', 'utf8');
+}
+fs.watchFile(announcementFilePath, { interval: 1000 }, async (curr, prev) => {
+  if (curr.mtime <= prev.mtime) return;
+  try {
+    const text = fs.readFileSync(announcementFilePath, 'utf8').trim();
+    if (!text) return;
+    console.log(`📢 Target Announcement Detected: "${text}"`);
+    const targetGroupId = process.env.ANNOUNCE_GROUP_ID || '120363422734230937@g.us';
+    const chat = await client.getChatById(targetGroupId);
+    if (chat.isGroup) {
+      const announcementText = `📢 *@all* \n\n${text}`;
+      const participantIds = chat.participants.map((p) => p.id._serialized);
+      await client.sendMessage(targetGroupId, announcementText, { mentions: participantIds });
+      console.log('✅ Mass announcement sent.');
+      fs.writeFileSync(announcementFilePath, '', 'utf8');
+    }
+  } catch (error) {
+    console.error('❌ Announcement pipeline failure:', error.message);
+  }
+});
+
+// =============================================================================
+// Trigger helpers
+// =============================================================================
+// Does the message address the bot — by name, @mention, or by quoting one of
+// the bot's own messages?
+function nameRegex() {
+  // word-boundary, case-insensitive match on the bot name
+  return new RegExp(`\\b${BOT_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
 }
 
-// Watch the announcement file for modifications every 1 second
-fs.watchFile(announcementFilePath, { interval: 1000 }, async (curr, prev) => {
-    if (curr.mtime <= prev.mtime) return; // File didn't change content safely
+function stripLeadingName(text) {
+  // Remove a leading "Livia" / "Livia," / "Livia:" / "hey Livia" address so the
+  // brain gets the real question.
+  const re = new RegExp(`^(hey |hi |yo |ok |okay )?${BOT_NAME}[\\s,:!-]*`, 'i');
+  return text.replace(re, '').trim() || text.trim();
+}
 
+async function addressesBot(msg, body) {
+  if (botId && Array.isArray(msg.mentionedIds) && msg.mentionedIds.includes(botId)) return true;
+  if (nameRegex().test(body)) return true;
+  if (msg.hasQuotedMsg) {
     try {
-        const text = fs.readFileSync(announcementFilePath, 'utf8').trim();
-        if (!text) return; // File is empty, do nothing
+      const quoted = await msg.getQuotedMessage();
+      if (quoted && quoted.fromMe) return true;
+    } catch (_e) {}
+  }
+  return false;
+}
 
-        console.log(`📢 Target Announcement Detected: "${text}"`);
+// Simple per-sender flood guard (silent). Uses the shared cache.
+async function isFlooding(sender) {
+  const key = `livia:flood:${sender}`;
+  const now = Date.now();
+  const times = (await cache.getJSON(key, [])).filter(
+    (t) => now - t < FLOOD_WINDOW_SEC * 1000
+  );
+  times.push(now);
+  await cache.setJSON(key, times, FLOOD_WINDOW_SEC);
+  return times.length > FLOOD_MAX;
+}
 
-        // ⚠️ REPLACE THIS with your true group ID when you grab it from your terminal logs!
-        const targetGroupId = '120363422734230937@g.us'; 
-
-        const chat = await client.getChatById(targetGroupId);
-        
-        if (chat.isGroup) {
-            // Create a clean message body using the universal tag layout
-            let announcementText = `📢 *@all* \n\n${text}`;
-
-            // Fetch all current participant IDs to attach in the background metadata
-            let participantIds = chat.participants.map(p => p.id._serialized);
-
-            // Fire the payload - it pings everyone at once without listing names out loud
-            await client.sendMessage(targetGroupId, announcementText, { 
-                mentions: participantIds 
-            });
-            
-            console.log('✅ Clean mass announcement blasted successfully.');
-
-            // Wipe the file clean so it doesn't loop fire
-            fs.writeFileSync(announcementFilePath, '', 'utf8');
-        }
-    } catch (error) {
-        console.error('❌ Announcement pipeline failure:', error);
-    }
-});
-
-// =========================================================================
-// MAIN INBOUND CHAT DISPATCHER (TEXT & IMAGES)
-// =========================================================================
-client.on('message_create', async (msg) => {
-    // 🔍 THIS WILL PRINT THE GROUP ID TO YOUR PM2 LOGS FOR ANY INBOUND MESSAGE:
-    //console.log(`➡️ Message incoming from ID: ${msg.from}`);
-
+// =============================================================================
+// MAIN INBOUND CHAT DISPATCHER (text only in Phase 1)
+// =============================================================================
+client.on('message', async (msg) => {
+  try {
     if (msg.fromMe) return;
 
+    const body = (msg.body || '').trim();
+    if (!body) return; // ignore pure media/stickers/calls for now
+
+    const chat = await msg.getChat();
+    const isGroup = chat.isGroup;
+
+    // Decide whether this message is for us.
     let shouldRespond = false;
-    let textToAnalyze = "";
+    if (isGroup) {
+      shouldRespond = await addressesBot(msg, body); // groups: named/mention/quote only
+    } else {
+      shouldRespond = DM_MODE === 'all' ? true : await addressesBot(msg, body);
+    }
+    if (!shouldRespond) return;
 
-    // SCENARIO A: User uploaded a screenshot image
-    if (msg.hasMedia && (msg.type === 'image' || msg.type === 'sticker')) {
-        try {
-            console.log(`\n📸 Image received. Activating Livia AI Vision Core...`);
-            
-            // Download the raw encrypted media file from WhatsApp servers
-            const media = await msg.downloadMedia();
-            if (!media || !media.data) return;
-
-            // Convert base64 data stream into an optimized buffer array
-            const imageBuffer = Buffer.from(media.data, 'base64');
-
-            // Scan the pixel matrices to extract readable text strings
-            const extractedText = await ocr.recognize(imageBuffer, ocrConfig);
-            console.log(`📝 OCR Extracted Text: \n"${extractedText.trim()}"`);
-
-            // Look for keywords in the image to determine if it's an error screenshot
-            const lowerText = extractedText.toLowerCase();
-            if (lowerText.includes("socksip") || lowerText.includes("custom") || lowerText.includes("error") || lowerText.includes("stuck") || lowerText.includes("fail") || lowerText.includes("timeout")) {
-                shouldRespond = true;
-                textToAnalyze = extractedText;
-                console.log("🎯 Relevant VPN context found inside screenshot!");
-            }
-        } catch (ocrError) {
-            console.error(`❌ Vision Processing Failure: ${ocrError.message}`);
-        }
-    } 
-    // SCENARIO B: Classic Text Conversations
-    else {
-        const cleanBody = msg.body ? msg.body.trim() : "";
-        if (!cleanBody) return;
-
-        if (cleanBody.toLowerCase().startsWith('Livia AI')) {
-            shouldRespond = true;
-            textToAnalyze = cleanBody.slice(5).trim();
-            
-            if (!textToAnalyze) {
-                msg.reply("Yes? I am here to help");
-                return;
-            }
-        } else if (msg.hasQuotedMsg) {
-            const quotedMsg = await msg.getQuotedMessage();
-            if (quotedMsg.fromMe) {
-                shouldRespond = true;
-                textToAnalyze = cleanBody;
-            }
-        }
+    // Flood guard (skip silently, don't burn quota or spam).
+    if (await isFlooding(msg.from)) {
+      console.log(`⏳ Skipping ${msg.from} (flooding).`);
+      return;
     }
 
-    // RUN THE BRAIN SYSTEM MODEL ENGINE
-    if (shouldRespond && textToAnalyze) {
-        // Sanitize string to prevent terminal execution injections
-        const sanitizedQuery = textToAnalyze.replace(/[^a-zA-Z0-9 ]/g, " ");
+    const question = stripLeadingName(body);
 
-        console.log(`🧠 Handing data to AI model: "${sanitizedQuery.substring(0, 50)}..."`);
+    // Typing indicator for a natural feel (best-effort).
+    try { await chat.sendStateTyping(); } catch (_e) {}
 
-        const pythonPath = '/home/clive/anaconda3/bin/python';
-        const scriptPath = path.join(__dirname, 'train_brain.py');
-        
-        // Match your exact original execution formatting style
-        exec(`${pythonPath} ${scriptPath} "${sanitizedQuery}"`, (error, stdout, stderr) => {
-            if (error) {
-                console.error(`❌ AI Engine Fault: ${error.message}`);
-                return;
-            }
+    const reply = await getReply(msg.from, question);
 
-            const aiReply = stdout.trim();
-            
-            // Rejection Gate: Handle unknown errors or low confidence predictions explicitly
-            if (aiReply.startsWith("I'm not completely sure")) {
-                const fallbackMessage = "Hmm, I'm not quite sure about that one! 🤔 Please wait for an admin to come online";
-                console.log(`⚠️ Unknown error encountered. Livia AI sending fallback notification.`);
-                msg.reply(fallbackMessage);
-                return;
-            }
-
-            console.log(`🤖 Livia AI Replied: "${aiReply}"`);
-            msg.reply(aiReply);
-        });
-    }
+    try { await chat.clearState(); } catch (_e) {}
+    await msg.reply(reply);
+    console.log(`🤖 ${BOT_NAME} -> ${msg.from}: "${reply.slice(0, 60)}"`);
+  } catch (error) {
+    // The reply pipeline already guarantees graceful output; this guards the
+    // dispatcher itself. Never surface an error to the chat.
+    console.error('❌ Dispatcher error:', error && error.message);
+  }
 });
 
-// NEW MEMBER INTERCEPTOR
+// =============================================================================
+// NEW MEMBER WELCOME (brand-neutral, friendly)
+// =============================================================================
 client.on('group_join', async (notification) => {
-    try {
-        const chat = await notification.getChat();
-        const newMembers = notification.recipientIds;
-        for (let memberId of newMembers) {
-            const cleanNumber = memberId.split('@')[0];
-            const welcomeGreeting = `Welcome to the Community, @${cleanNumber}! 🎉\n\nI am *Livia AI*. Send me screenshots of any configuration errors or text *\"Livia AI help\"* and I will be here to help`;
-            await chat.sendMessage(welcomeGreeting, { mentions: [memberId] });
-        }
-    } catch (error) { console.error(error); }
+  try {
+    const chat = await notification.getChat();
+    for (const memberId of notification.recipientIds) {
+      const cleanNumber = memberId.split('@')[0];
+      const welcome =
+        `Welcome, @${cleanNumber}! 🎉\n\nI'm *${BOT_NAME}*, Clive's assistant. ` +
+        `Say my name anytime and I'll jump in. 🙂`;
+      await chat.sendMessage(welcome, { mentions: [memberId] });
+    }
+  } catch (error) {
+    console.error('❌ Welcome error:', error && error.message);
+  }
 });
 
 client.initialize();

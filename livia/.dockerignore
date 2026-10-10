@@ -1,0 +1,12 @@
+node_modules
+npm-debug.log
+sessions
+.wwebjs_cache
+.wwebjs_auth
+knowledge/.memory
+.env
+*.rdb
+*.aof
+.git
+deploy
+test

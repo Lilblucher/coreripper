@@ -1,0 +1,434 @@
+{
+  "intents": [
+    {
+      "tag": "greeting",
+      "patterns": [
+        "hi",
+        "hello",
+        "laka",
+        "anyone online",
+        "hey",
+        "wassup",
+        "sup",
+        "good day",
+        "how are you",
+        "how are you doing",
+        "how far",
+        "wazzup",
+        "good morning",
+        "good evening",
+        "good afternoon",
+        "is anyone there"
+      ],
+      "responses": [
+        "Hello! I am Livia AI — your support assistant. How can I help you today? 😊",
+        "Hi there! Livia AI here and ready to assist. What can I do for you?",
+        "Hey! Livia AI online. What do you need help with?"
+      ]
+    },
+    {
+      "tag": "assist",
+      "patterns": [
+        "Livia AI help",
+        "help",
+        "assist me",
+        "i need help",
+        "can you help",
+        "support",
+        "i have a problem",
+        "i have an issue"
+      ],
+      "responses": [
+        "Of course! What seems to be the problem? 🛠️",
+        "I'm here! What do you need help with?",
+        "Sure — describe your issue or send a screenshot and I'll diagnose it! 📸"
+      ]
+    },
+    {
+      "tag": "appreciation",
+      "patterns": [
+        "thanks",
+        "thank you",
+        "thank you very much",
+        "thanks a lot",
+        "much appreciated",
+        "cheers",
+        "thank you Livia AI"
+      ],
+      "responses": [
+        "You're welcome! 😊 Let me know if you need anything else.",
+        "Anytime! Happy to help.",
+        "No problem at all! Feel free to ask if something else comes up. 👍"
+      ]
+    },
+    {
+      "tag": "vpn_status",
+      "patterns": [
+        "vpn status",
+        "which servers are working",
+        "are the servers down",
+        "when will files expire",
+        "current situation",
+        "is zivpn down",
+        "is socksip working",
+        "http custom status",
+        "server status",
+        "what servers are online",
+        "is the vpn working today"
+      ],
+      "responses": [
+        "📊 *REAL-TIME NETWORK BOARD* 📊\n\n🟢 *HTTP CUSTOM STATUS:*\n• Status: [RUNNING]\n• Server Health: Excellent\n• File Expiry Date: 24/06/2026\n\n🔵 *SOCKSIP STATUS:*\n• Status: [RUNNING]\n• Server Health: Excellent\n• File Expiry Date: 23/06/2026\n\n🟡 *ZIVPN STATUS:*\n• Status: [MAINTENANCE]\n• Server Health: Offline\n• File Expiry Date: 24/06/2026\n\n📌 *Admin Note:* If a server is listed as running but you cannot connect, toggle Airplane Mode for 5 seconds to reset your IP, or drop a screenshot of your error log."
+      ]
+    },
+    {
+      "tag": "download_help",
+      "patterns": [
+        "how to download",
+        "where is the config",
+        "download error",
+        "guide me on how to go about the vpns",
+        "i am new",
+        "how to use the vpn",
+        "help me setup",
+        "how do i get started",
+        "setup guide",
+        "how to install vpn",
+        "where do i download the app"
+      ],
+      "responses": [
+        "Here is your complete setup guide! 🚀\n\n*STEP 1: Download your preferred VPN app* 👇\n\n🔹 *HTTP Custom:* https://play.google.com/store/apps/details?id=xyz.easypro.httpcustom\n\n🔹 *SocksIP:* https://play.google.com/store/apps/details?id=com.newtoolsworks.sockstunnel\n\n🔹 *ZiVPN:* https://play.google.com/store/apps/details?id=com.zi.zivpn\n\n*STEP 2: Download the config file* 📂\nVisit *www.vpn-config.online*, select your app, and download the latest active config file.\n\n*STEP 3: Import and connect* 🔌\n1️⃣ Open your VPN app.\n2️⃣ Tap the menu or '+' icon → select *Import Config*.\n3️⃣ Locate the file in your Downloads folder and load it.\n4️⃣ Hit *CONNECT* and enjoy your free secure internet!"
+      ]
+    },
+    {
+      "tag": "link",
+      "patterns": [
+        "where are the configuration files",
+        "vpn file",
+        "vpn files",
+        "link to config",
+        "config file link",
+        "where to get config",
+        "send me the config link"
+      ],
+      "responses": [
+        "To download a config file, visit *www.vpn-config.online* 🌐\n\nSelect your app, temporarily disable any ad blocker or proxy, and complete the short ad verification. Your download will start right after! 📥"
+      ]
+    },
+    {
+      "tag": "http_custom_auth_error",
+      "patterns": [
+        "failed to initialize client auth error",
+        "auth error",
+        "authentication error",
+        "http custom auth",
+        "http custom authorization error",
+        "Livia AI auth error",
+        "authorization failed http custom"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Auth Error — Config Expired]* 🔴\n\nThis config file has expired. Please visit *www.vpn-config.online* to download the latest HTTP Custom config and re-import it.\n\n📌 Always check the status board for the current expiry date before connecting!"
+      ]
+    },
+    {
+      "tag": "http_custom_no_activity",
+      "patterns": [
+        "no recent network activity",
+        "network activity stop",
+        "connection stuck no activity",
+        "no response from server",
+        "http custom no activity",
+        "http custom stuck on loading",
+        "connection established but no data"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[No Recent Network Activity]* 🟡\n\nThe VPN tunnel connected but no data is flowing through. This means:\n• Your cellular signal is weak or unstable, OR\n• Our premium server is temporarily overloaded.\n\n✅ Fix:\n1️⃣ Toggle Airplane Mode ON → wait 5 seconds → toggle OFF to refresh your IP.\n2️⃣ Try a different server from the config options.\n3️⃣ Check the status board — the server may be under maintenance."
+      ]
+    },
+    {
+      "tag": "http_custom_disconnect_loop",
+      "patterns": [
+        "http custom keeps disconnecting",
+        "http custom disconnects after a few minutes",
+        "http custom not staying connected",
+        "http custom drops connection",
+        "vpn disconnects every 10 minutes",
+        "vpn disconnects every 20 minutes",
+        "http custom unstable",
+        "http custom connection drops randomly"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Unstable Connection / Disconnect Loop]* 🟡\n\nThis usually happens with a locked config or battery optimization killing the app.\n\n✅ Steps to fix:\n1️⃣ Enter server details *manually* inside the app instead of using a locked file.\n2️⃣ Settings → Apps → HTTP Custom → Battery → set to *Unrestricted*.\n3️⃣ Toggle Airplane Mode on/off and reconnect.\n4️⃣ If still failing, download a fresh config from *www.vpn-config.online* 📂"
+      ]
+    },
+    {
+      "tag": "http_custom_cant_disconnect",
+      "patterns": [
+        "http custom won't disconnect",
+        "http custom stuck on connecting",
+        "http custom connecting forever",
+        "how to force stop http custom",
+        "vpn stuck connecting",
+        "http custom frozen",
+        "http custom not responding"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Stuck on Connecting]* 🔴\n\nHTTP Custom cannot be force-stopped using its own button while it is still trying to connect.\n\n✅ Fix:\n1️⃣ Toggle *Mobile Data or Wi-Fi OFF* for a few seconds → turn it back on — this forces the connection attempt to stop.\n2️⃣ If the app is frozen: Settings → Apps → HTTP Custom → *Force Stop* → reopen the app."
+      ]
+    },
+    {
+      "tag": "http_custom_tethering",
+      "patterns": [
+        "how to share http custom",
+        "hotspot not working http custom",
+        "http custom tethering",
+        "http custom hotspot",
+        "usb tethering http custom",
+        "share vpn connection",
+        "share http custom connection"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Hotspot / Tethering Setup]* 📡\n\n✅ Steps:\n1️⃣ Connect HTTP Custom first until you see *CONNECTED*.\n2️⃣ Then enable your Hotspot or USB Tethering.\n3️⃣ Check the app log for the proxy IP and port.\n\n📌 Default proxy addresses:\n• *Hotspot:* 192.168.43.1 : 7071\n• *USB Tethering:* 192.168.42.129 : 7071\n\nOn the connecting device, set the proxy manually to those details and you're good to go!"
+      ]
+    },
+    {
+      "tag": "socksip_error",
+      "patterns": [
+        "socksip not connecting",
+        "socksip stuck",
+        "sip file error",
+        "socksip slow",
+        "socksip not working",
+        "socksip connection failed"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[SocksIP Connection Issue]* 🟡\n\n✅ Try these steps:\n1️⃣ Clear the app cache: Settings → Apps → SocksIP → Storage → *Clear Cache*.\n2️⃣ Download the latest config from *www.vpn-config.online* and re-import.\n3️⃣ Toggle Airplane Mode on/off to refresh your IP.\n4️⃣ Make sure battery optimization is set to *Unrestricted* for SocksIP."
+      ]
+    },
+    {
+      "tag": "socksip_invalid_stream",
+      "patterns": [
+        "invalid stream header",
+        "socksip deletes config",
+        "socksip config disappears",
+        "socksip file not loading",
+        "sip config error after import",
+        "socksip config reset",
+        "socksip config keeps disappearing"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Invalid Stream Header — Config Deleted Bug]* 🔴\n\nThis is a known SocksIP bug where the app throws an 'Invalid Stream Header' error after import and deletes the config.\n\n✅ Workaround:\n1️⃣ Re-download the latest config from *www.vpn-config.online*.\n2️⃣ Re-import and connect *immediately* — do not close the app.\n3️⃣ Keep SocksIP running in the background; fully closing it can trigger the bug again.\n4️⃣ If it keeps happening, uninstall and reinstall SocksIP."
+      ]
+    },
+    {
+      "tag": "socksip_dns_tunnel_crash",
+      "patterns": [
+        "socksip dns crash",
+        "socksip dns tunnel not working",
+        "dnstt crash socksip",
+        "socksip dns error",
+        "slow dns socksip not working",
+        "socksip udp crash",
+        "socksip dns tunnel crash"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[DNS Tunnel / DNSTT Crash]* 🔴\n\nThis is a crash bug in older SocksIP versions.\n\n✅ Fix:\n1️⃣ Update SocksIP to the latest version from our website or Play Store.\n2️⃣ If DNS Tunnel keeps crashing, switch your tunnel mode to *SSH* or *WebSocket (WS)* as a stable alternative.\n3️⃣ Clear app cache: Settings → Apps → SocksIP → Storage → *Clear Cache*, then restart."
+      ]
+    },
+    {
+      "tag": "socksip_disconnects_immediately",
+      "patterns": [
+        "socksip disconnects immediately",
+        "socksip connected then drops",
+        "socksip keeps dropping",
+        "socksip won't stay connected",
+        "sip vpn disconnects",
+        "socksip unstable after update",
+        "socksip drops right after connecting"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Disconnects Immediately After Connecting]* 🟡\n\nThis is a known regression bug in a recent SocksIP update.\n\n✅ Fix:\n1️⃣ Settings → Apps → SocksIP → Battery → set to *Unrestricted*.\n2️⃣ Clear cache and re-import the config from *www.vpn-config.online*.\n3️⃣ Try switching tunnel mode (e.g. SSH → WebSocket or UDP).\n4️⃣ If still failing, download a previous stable version from *Uptodown.com* while waiting for a developer fix."
+      ]
+    },
+    {
+      "tag": "zivpn_disconnects",
+      "patterns": [
+        "zivpn keeps disconnecting",
+        "zivpn disconnects immediately",
+        "zivpn drops connection",
+        "zivpn not stable",
+        "zivpn reconnects",
+        "zivpn connected but drops",
+        "zivpn unstable",
+        "zivpn won't stay connected"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[ZiVPN Keeps Disconnecting]* 🟡\n\n✅ Try these steps:\n1️⃣ Settings → Apps → ZiVPN → Battery → set to *Unrestricted* ← most common cause!\n2️⃣ Switch tunneling protocol — try *V2Ray* or *SSH via WebSocket*.\n3️⃣ Toggle Airplane Mode on/off and reconnect.\n4️⃣ Try a different server region.\n5️⃣ Re-download a fresh config from *www.vpn-config.online* 📂\n\n📌 *Note:* ZiVPN is currently under MAINTENANCE — check the status board for updates!"
+      ]
+    },
+    {
+      "tag": "zivpn_udp_not_working",
+      "patterns": [
+        "zivpn udp not working",
+        "zivpn udp connected no internet",
+        "zivpn udp old phone",
+        "zivpn udp android 6",
+        "udp mode zivpn fails",
+        "zivpn udp server down",
+        "zivpn udp mode no internet"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[ZiVPN UDP Not Working]* 🟡\n\nTwo known causes:\n\n📌 *Old Android (Android 6 and below):* UDP tunneling fails to route traffic on older Android versions. Switch to *SSH* or *V2Ray/VMess* mode instead.\n\n📌 *Server-side issue:* Some ZiVPN UDP servers (e.g. South Africa) are reported down. Switch to a different server region or use custom server credentials.\n\n📌 ZiVPN is currently under maintenance — monitor the status board!"
+      ]
+    },
+    {
+      "tag": "zivpn_config_not_working",
+      "patterns": [
+        "zivpn config not working",
+        "zivpn imported file won't connect",
+        "zivpn unlimited file fails",
+        "zivpn config expired",
+        "zivpn file error",
+        "zivpn import failed",
+        "zivpn file not connecting"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[ZiVPN Config File Not Working]* 🔴\n\nPossible causes:\n1️⃣ *Expired config* — Re-download from *www.vpn-config.online*. Always check the expiry date on the status board!\n2️⃣ *Wrong source* — Only use official config files from our website. Third-party configs may be outdated.\n3️⃣ *Version mismatch* — If ZiVPN was recently updated, re-download the config to match.\n4️⃣ *Permission issue* — Settings → Apps → ZiVPN → Permissions → ensure VPN permission is granted."
+      ]
+    },
+    {
+      "tag": "zivpn_permission_denied",
+      "patterns": [
+        "zivpn permission error",
+        "zivpn vpn permission",
+        "zivpn won't start",
+        "zivpn no permission",
+        "zivpn access denied",
+        "vpn permission not granted",
+        "zivpn permission denied"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[VPN Permission Not Granted]* 🔴\n\nAll VPN apps require your phone to grant VPN permission before they can work.\n\n✅ Fix:\n1️⃣ Open ZiVPN — tap *OK/Allow* on the *'Connection Request'* pop-up.\n2️⃣ If you denied it: Settings → Apps → ZiVPN → Permissions → enable VPN.\n3️⃣ Also check: Settings → Network & Internet → VPN — make sure ZiVPN is not blocked.\n4️⃣ Restart the app and try connecting again."
+      ]
+    },
+    {
+      "tag": "general_battery_optimization",
+      "patterns": [
+        "vpn keeps stopping",
+        "vpn stops when screen off",
+        "vpn disconnects when phone sleeps",
+        "battery killing vpn",
+        "vpn stops in background",
+        "vpn not running background",
+        "vpn turns off automatically",
+        "vpn disconnects when screen locks"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Battery Optimization Killing VPN]* 🔋\n\nYour phone's battery saver is shutting down the VPN app when your screen turns off. This is one of the most common disconnection causes on Android!\n\n✅ Fix:\n1️⃣ Settings → Apps → *[Your VPN App]* → Battery → set to *Unrestricted*.\n2️⃣ Settings → Battery → Battery Saver → turn it *OFF* or exclude your VPN app.\n3️⃣ For Xiaomi/MIUI users: also check *Security → Battery* and disable power restrictions for the VPN app."
+      ]
+    },
+    {
+      "tag": "general_connected_no_internet",
+      "patterns": [
+        "vpn connected but no internet",
+        "connected but can't browse",
+        "vpn shows connected but nothing loads",
+        "vpn on but internet not working",
+        "connected but browsing not working",
+        "vpn active but pages not loading",
+        "vpn connected no data"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Connected But No Internet]* 🟡\n\nThe VPN tunnel is up but traffic isn't routing through correctly.\n\n✅ Try these steps:\n1️⃣ Toggle Airplane Mode on/off for 5 seconds, then reconnect.\n2️⃣ Disconnect VPN, clear the app cache, and reconnect.\n3️⃣ Switch to a *different server* — the current one may be overloaded.\n4️⃣ Change tunnel protocol (e.g. SSH → V2Ray or WebSocket).\n5️⃣ Check Private DNS: Settings → Network → Private DNS → set to *Off* or *Automatic*, then retry."
+      ]
+    },
+    {
+      "tag": "general_slow_speed",
+      "patterns": [
+        "vpn too slow",
+        "slow internet on vpn",
+        "browsing slow on vpn",
+        "vpn lagging",
+        "videos not loading vpn",
+        "poor speed vpn",
+        "how to make vpn faster",
+        "slow download on vpn",
+        "vpn speed is bad"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[Slow VPN Speed]* ⚡\n\nSlow speeds are usually caused by an overloaded server or a weak signal.\n\n✅ Tips to boost speed:\n1️⃣ Switch to a *different server* — choose one with fewer users or closer location.\n2️⃣ Toggle Airplane Mode on/off to get a fresh IP and network route.\n3️⃣ Make sure you have a strong *4G/LTE signal* — VPN speed depends entirely on your base connection.\n4️⃣ Close all background apps using data.\n5️⃣ For HTTP Custom & ZiVPN, enable *TCP No Delay* in app settings for a speed boost."
+      ]
+    },
+    {
+      "tag": "general_wrong_network",
+      "patterns": [
+        "vpn not working on wifi",
+        "vpn only works on data",
+        "vpn blocked on wifi",
+        "vpn not working at school",
+        "vpn not working at work",
+        "wifi blocking vpn",
+        "network blocking vpn",
+        "vpn blocked by isp"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[VPN Blocked on This Network]* 🚫\n\nSome Wi-Fi networks (schools, offices, public hotspots) actively block VPN traffic. This is a network restriction, not an app problem.\n\n✅ Options:\n1️⃣ Switch from Wi-Fi to *Mobile Data* — cellular networks rarely block VPNs.\n2️⃣ Try changing the tunnel protocol to use *port 443* (HTTPS) — much harder to block.\n3️⃣ ZiVPN: try *SSL/Stunnel* or *V2Ray + WebSocket TLS* to disguise traffic as normal HTTPS.\n4️⃣ HTTP Custom: adjust your payload to run on port 443."
+      ]
+    },
+    {
+      "tag": "general_update_app",
+      "patterns": [
+        "app not working after update",
+        "vpn broken after update",
+        "new update broke vpn",
+        "app crashing after update",
+        "update caused error",
+        "should i update vpn app",
+        "vpn stopped after update"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[App Update Issue]* 🔄\n\n✅ Steps:\n1️⃣ Re-download your config from *www.vpn-config.online* — app updates sometimes require a matching config update.\n2️⃣ Clear app cache: Settings → Apps → *[VPN App]* → Storage → *Clear Cache*.\n3️⃣ If the new version is very buggy, download a previous stable version from *Uptodown.com*.\n4️⃣ Ensure your Android OS is up to date — outdated OS versions can clash with updated apps."
+      ]
+    },
+    {
+      "tag": "general_airplane_mode_tip",
+      "patterns": [
+        "how to reset ip",
+        "how to refresh network",
+        "reset network connection",
+        "how to fix vpn quickly",
+        "quick fix vpn",
+        "first thing to try vpn",
+        "what should i try first"
+      ],
+      "responses": [
+        "💡 *Quick Fix Tip from Livia AI:*\n\nThe fastest first step for almost any VPN issue:\n\n✈️ Toggle *Airplane Mode ON* → wait 5 seconds → toggle *Airplane Mode OFF*\n\nThis resets your network connection and gives you a fresh IP address, which instantly fixes the majority of connection errors!\n\nIf that doesn't work, send a screenshot of your app log and we'll dig deeper. 🔍"
+      ]
+    },
+    {
+      "tag": "general_conflicting_vpn",
+      "patterns": [
+        "two vpns at same time",
+        "another vpn installed",
+        "vpn conflict",
+        "can i use two vpns",
+        "vpn not working another vpn",
+        "other vpn app interfering",
+        "two vpn apps conflict"
+      ],
+      "responses": [
+        "Livia AI Diagnostic: *[VPN Conflict]* ⚠️\n\nAndroid only allows *one active VPN* at a time. Multiple VPN apps can interfere with each other.\n\n✅ Fix:\n1️⃣ Make sure all other VPN apps are *fully disconnected* (not just minimized).\n2️⃣ Settings → Network & Internet → VPN → remove any unused old VPN profiles.\n3️⃣ Restart your phone to clear lingering VPN sessions, then connect with your preferred app only."
+      ]
+    },
+    {
+      "tag": "socksip_expired",
+      "patterns": [
+        "file invalid error file expired",
+        "socksip file has expired",
+        "socksip expired file"
+      ],
+      "responses": [
+        "The file you're trying to use has expired to get the latest file visit our website www.vpn-config.online"
+      ]
+    }
+  ]
+}

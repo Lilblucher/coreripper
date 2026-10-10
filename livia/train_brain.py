@@ -1,62 +1,130 @@
-#! /usr/env python3
+#!/usr/bin/env python3
+"""Livia's OFFLINE fallback brain.
 
+Dependency-free (pure standard library) intent matcher used ONLY when the AI
+providers (Groq, Gemini) are unavailable or rate-limited. It is deliberately
+tiny: a bag-of-words / token-overlap scorer over the patterns in intents.json.
+
+Replaces the old scikit-learn + numpy logistic-regression version so the bot
+runs in a slim container (and on any python3) with nothing to install.
+
+CLI contract (unchanged, called by whatsapp_bot.js / brain/reply.js):
+    python3 train_brain.py "the user message"
+Prints a single response line to stdout. On a low-confidence / unknown match it
+prints the exact sentinel below so the Node side can route to the last-resort
+layer instead of guessing.
+"""
 
 import json
-import sys
 import os
-import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.linear_model import LogisticRegression
+import random
+import re
+import sys
+import math
+from collections import Counter
 
-# 1. Load your intents configuration profile
-INTENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'intents.json')
-with open(INTENTS_FILE, 'r') as file:
-    data = json.load(file)
+LOW_CONFIDENCE_SENTINEL = "__LIVIA_UNSURE__"
 
-# 2. Extract and organize patterns and labels
-training_sentences = []
-training_labels = []
-intent_responses = {}
+INTENTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intents.json")
 
-for intent in data['intents']:
-    tag = intent['tag']
-    intent_responses[tag] = intent['responses'][0] # Keep responses handy
-    for pattern in intent['patterns']:
-        training_sentences.append(pattern.lower())
-        training_labels.append(tag)
+# Words too common to carry intent signal — ignored during scoring.
+STOPWORDS = {
+    "a", "an", "the", "is", "am", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "at", "for", "and", "or", "but", "if", "so", "do",
+    "does", "did", "i", "you", "he", "she", "it", "we", "they", "me", "my",
+    "your", "this", "that", "with", "can", "could", "would", "will", "just",
+    "please", "pls",
+}
 
-# 3. Vectorization Engine (Bag of Words Pipeline Matrix)
-vectorizer = CountVectorizer()
-X_train = vectorizer.fit_transform(training_sentences).toarray()
-y_train = training_labels
+_TOKEN_RE = re.compile(r"[a-z0-9']+")
 
-# 4. Train the Classification Model
-# Logistic Regression handles structural text boundaries extremely well
-model = LogisticRegression(C=1.0, max_iter=1000)
-model.fit(X_train, y_train)
 
-# 5. Live Prediction Interface Execution Gate
+def tokenize(text):
+    return [t for t in _TOKEN_RE.findall((text or "").lower())]
+
+
+def content_tokens(text):
+    return [t for t in tokenize(text) if t not in STOPWORDS]
+
+
+def load_intents():
+    with open(INTENTS_FILE, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return data.get("intents", [])
+
+
+def build_index(intents):
+    """Precompute, per intent: the set of pattern token-sets + document frequency
+    so rarer words count for more (a light IDF weighting)."""
+    docs = []  # list of (tag, token_counter, raw_tokens_set)
+    doc_freq = Counter()
+    for intent in intents:
+        tag = intent.get("tag", "")
+        for pattern in intent.get("patterns", []):
+            toks = content_tokens(pattern)
+            if not toks:
+                toks = tokenize(pattern)  # fall back to all tokens for 1-word stop patterns
+            counter = Counter(toks)
+            docs.append((tag, counter, set(toks)))
+            for t in set(toks):
+                doc_freq[t] += 1
+    return docs, doc_freq, max(len(docs), 1)
+
+
+def score(query_tokens, doc_tokens_set, doc_freq, n_docs):
+    """Weighted overlap: shared tokens scored by inverse document frequency."""
+    if not query_tokens:
+        return 0.0
+    q = set(query_tokens)
+    shared = q & doc_tokens_set
+    if not shared:
+        return 0.0
+    s = 0.0
+    for t in shared:
+        idf = math.log((n_docs + 1) / (1 + doc_freq.get(t, 0))) + 1.0
+        s += idf
+    # Normalize by query length so long messages don't inflate the score.
+    return s / math.sqrt(len(q))
+
+
 def predict_response(user_message):
-    user_message = user_message.lower()
-    
-    # Process text through the same vocabulary matrix mapping
-    transformed_input = vectorizer.transform([user_message]).toarray()
-    
-    # Extract prediction probability distributions
-    probabilities = model.predict_proba(transformed_input)[0]
-    max_index = np.argmax(probabilities)
-    confidence_score = probabilities[max_index]
-    
-    #confidence_score
-    if confidence_score < 0.20:
-        return "I'm not completely sure how to help with that request. Please wait for the admin to get online, or visit our website layout details!"
-        
-    predicted_tag = model.classes_[max_index]
-    return intent_responses[predicted_tag]
+    try:
+        intents = load_intents()
+    except Exception:
+        return LOW_CONFIDENCE_SENTINEL
 
-# Allow execution via runtime arguments from our Node.js gateway
+    responses_by_tag = {
+        it.get("tag", ""): it.get("responses", []) for it in intents
+    }
+
+    q_tokens = content_tokens(user_message)
+    if not q_tokens:
+        q_tokens = tokenize(user_message)
+
+    docs, doc_freq, n_docs = build_index(intents)
+
+    best_tag = None
+    best_score = 0.0
+    for tag, _counter, tok_set in docs:
+        sc = score(q_tokens, tok_set, doc_freq, n_docs)
+        if sc > best_score:
+            best_score = sc
+            best_tag = tag
+
+    # Confidence gate. Token-overlap scores for a real hit are typically >= ~1.0;
+    # noise sits well below. Keep the bar low enough to be useful, high enough to
+    # avoid confidently answering gibberish.
+    if best_tag is None or best_score < 1.0:
+        return LOW_CONFIDENCE_SENTINEL
+
+    options = responses_by_tag.get(best_tag) or []
+    if not options:
+        return LOW_CONFIDENCE_SENTINEL
+    return random.choice(options)
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        incoming_query = sys.argv[1]
-        print(predict_response(incoming_query))
-
+        print(predict_response(sys.argv[1]))
+    else:
+        print(LOW_CONFIDENCE_SENTINEL)

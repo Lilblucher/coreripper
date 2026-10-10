@@ -9,8 +9,8 @@
     },
     {
       "name": "frontend",
-      "runtimeExecutable": "python3",
-      "runtimeArgs": ["_nocache_server.py", "5501"],
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["frontend/run_local.sh"],
       "port": 5501
     }
   ]
